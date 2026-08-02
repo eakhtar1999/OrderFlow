@@ -43,6 +43,24 @@ spring:
       # instead of a property placeholder. No client-id key here anymore
       # on purpose — the source of truth moved to Java.
 
+    # Build Order Step 4: this service was pure-consumer through Step 3 —
+    # no producer config existed anywhere in this file. Retry topics
+    # change that. When @RetryableTopic's error handling decides a
+    # message needs to move to the next retry topic (or the DLT), it does
+    # that by PUBLISHING the record there — which means this consumer-only
+    # service now needs a working producer too. We don't define a custom
+    # KafkaTemplate bean for it (contrast with the hand-built
+    # ConsumerFactory in KafkaConsumerConfig.java) — Spring Boot's
+    # autoconfiguration builds a default one straight from these
+    # properties, the same way order-service's producer side always has,
+    # and that's the exact bean Spring Kafka's retry-topic machinery
+    # looks up and uses automatically.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      properties:
+        schema.registry.url: http://localhost:8085
+
 logging:
   level:
     com.orderflow: INFO
