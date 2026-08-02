@@ -19,6 +19,7 @@ out of band, on its own schedule, not on the request thread.
 | This service's first-ever consumer | `status/OrderStatusUpdater.java` | Everything through Step 7 flowed OUT of this service; Step 8's saga changes that — 5 `@KafkaListener` methods react to every event the saga produces, translating each into an `order-status` write. It makes NO decisions and triggers nothing else — a pure "read model updater," the same idea Build Order Step 9's Redis-backed "track my order" endpoint will eventually read FROM |
 | Compacted `order-status` finally does real work | `status/OrderStatusUpdater.java` | Through Step 7 every order wrote `order-status` exactly ONCE ("CREATED"), so log compaction (Step 5's whole justification for this topic) had nothing to discard. Now an order genuinely transitions through multiple statuses (RESERVED → PAID → SHIPPED, or RESERVED → PAYMENT_FAILED), and only the latest survives compaction — verified live in the root README's Step 8 walkthrough |
 | Avro consumer deserializer, found missing live | `application.yml` | This service's brand-new `OrderStatusUpdater` consumer hit the exact same `StringDeserializer`-by-default bug `payment-service` did — see the root README's "A real bug, found live" section |
+| Redis-backed token-bucket rate limiting | `rate/TokenBucketRateLimiter.java`, `controller/OrderController.java` | Per-customerId, atomic via a Redis Lua script (read-refill-consume-write as one uninterruptible operation) — checked BEFORE Bean Validation even runs, so an over-quota customer costs this service nothing beyond a Redis round trip. Verified live: exactly 5 of 10 rapid-fire requests succeeded (capacity=5), the rest got 429 instantly; a different customerId was completely unaffected |
 
 ## Try the hands-on exercises
 
@@ -60,6 +61,16 @@ order for this module:
    --bootstrap-server localhost:9092 --list` — confirm no new topics were
    needed for Step 8's `OrderStatusUpdater`; it only ever reads existing
    topics and writes to `order-status`, already declared back in Step 5.
+9. **Build Order Step 9**: fire 10 `POST /api/orders` requests for the
+   SAME `customerId` in a tight loop (a bash `for` loop, no delay) —
+   confirm the first 5 return `202`, the rest `429`. Then fire the same
+   burst for a DIFFERENT `customerId` and confirm it's unaffected. Wait
+   ~5 seconds and retry the first customer — confirm it succeeds again,
+   refilled roughly 1 token/second, not all 5 at once.
+10. `application.yml` — change `order.rate-limit.capacity` to `1` and
+    restart. Confirm even a SINGLE burst of 2 rapid requests now gets one
+    `202` and one `429` — the smallest possible token bucket, useful for
+    seeing the rejection trigger without needing 5+ requests.
 
 ## What's deliberately NOT here yet
 
@@ -78,5 +89,9 @@ order for this module:
   simplification to keep this step focused on the outbox pattern itself
 - No REST endpoint to actually READ `order-status` — `OrderStatusUpdater`
   writes it, but nothing in this service exposes a "track my order"
-  endpoint yet; that arrives with Build Order Step 9's Redis-backed
-  materialized view
+  endpoint yet
+- The rate limiter is per-customerId only — no separate global or
+  per-IP limit, so a customer with many legitimate concurrent devices
+  and an attacker cycling fake customerIds are treated identically
+  (unaddressed, a real gap a production deployment would need a second
+  layer for)

@@ -142,11 +142,26 @@ services:
   #     - "8083:8083"
 
   # ── Redis (Build Order Step 9) ───────────────────────────────────────
-  # redis:
-  #   image: redis:7
-  #   container_name: orderflow-redis
-  #   ports:
-  #     - "6379:6379"
+  # Four completely different use cases share this ONE Redis instance:
+  # cache-aside for inventory-service's stock (Postgres is the source of
+  # truth, Redis is the read-through cache), a distributed lock preventing
+  # overselling across concurrent inventory-service instances, an
+  # idempotent-consumer dedupe store, and a token-bucket rate limiter for
+  # order-service's REST API. Sharing one instance is a real, deliberate
+  # simplification — a production deployment would likely give at least
+  # the rate limiter and the dedupe store their own logical databases (or
+  # separate Redis instances entirely) so a noisy neighbor on one use case
+  # can't evict keys another use case needs.
+  redis:
+    image: redis:7
+    container_name: orderflow-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   # ── Elasticsearch + Kibana (Build Order Step 10) ─────────────────────
   # elasticsearch:

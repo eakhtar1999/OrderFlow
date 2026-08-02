@@ -32,6 +32,13 @@ spring:
       # tooling.
       mode: always
 
+  # Build Order Step 9: backs TokenBucketRateLimiter — the ONLY thing
+  # order-service uses Redis for.
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
   kafka:
     bootstrap-servers: localhost:9092
 
@@ -98,6 +105,16 @@ spring:
 outbox:
   relay:
     poll-interval-ms: 500
+
+# Build Order Step 9: TokenBucketRateLimiter's knobs. capacity=5 means a
+# customer can burst up to 5 requests instantly; refill-per-second=1
+# means the bucket regains one token per second after that — see
+# TokenBucketRateLimiter's TRY IT YOURSELF for the exact test this is
+# tuned to make easy to observe within a few seconds, not minutes.
+order:
+  rate-limit:
+    capacity: 5
+    refill-per-second: 1
 
 logging:
   level:

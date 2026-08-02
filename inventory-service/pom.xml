@@ -58,6 +58,36 @@
             <version>${confluent.version}</version>
         </dependency>
 
+        <!-- Build Order Step 9: stock moves from an in-memory ConcurrentHashMap
+             (per-instance, resets on restart) to Postgres — the real source of
+             truth cache-aside needs something to sit IN FRONT OF. JdbcTemplate,
+             not JPA, for the same reason order-service's outbox tables stayed
+             plain SQL: one table, no relationships, nothing an ORM's session
+             machinery would clarify. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Redis, via Spring Data Redis's RedisTemplate — used for THREE
+             unrelated things in this one service: the cache-aside read
+             layer in front of the stock table, a SETNX-based distributed
+             lock preventing overselling across instances, and an
+             idempotent-consumer dedupe store keyed by orderId. Lettuce
+             (Spring Boot's default Redis client) is what's actually on
+             the classpath here, not Jedis — chosen automatically by
+             spring-boot-starter-data-redis, not something we picked. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

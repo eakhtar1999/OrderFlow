@@ -13,7 +13,7 @@ increment, not a half-finished sketch of the next one.
 
 ## Where we are right now
 
-**Build Order Steps 1–8 are done:** `order-service` publishes to Kafka;
+**Build Order Steps 1–9 are done:** `order-service` publishes to Kafka;
 `inventory-service` consumes, checks in-memory stock, and logs a
 reservation decision (Step 1) — scales horizontally with a rebalance
 listener that logs partition hand-off as instances join, leave, or crash
@@ -39,7 +39,15 @@ an orchestration saga where a new `order-saga-orchestrator` service calls
 all three downstream services directly and synchronously over REST,
 wrapped in Resilience4j `@CircuitBreaker` + `@Retry` — both with a real,
 live-tested compensating-transaction path when payment is declined
-(Step 8). Everything else below is roadmap.
+(Step 8) — and Redis now backs four previously-documented gaps:
+inventory-service's stock moved from an in-memory map to Postgres with a
+genuine cache-aside read layer in front of it, a Redis distributed lock
+closes the overselling race condition that was reproducible since Step 1
+(verified live across TWO real inventory-service instances), an
+idempotent-consumer dedupe store makes message redelivery actually safe
+instead of just documented as unsafe, and order-service's REST API is now
+rate-limited per customer with a token bucket implemented as an atomic
+Redis Lua script (Step 9). Everything else below is roadmap.
 
 ## Target architecture
 
@@ -76,7 +84,10 @@ flowchart LR
 
     SI --> ES[(Elasticsearch ⬜)]
     AN -.->|Build Order Step 10| ES
-    IS -.->|cache-aside, dedupe, locks| R[(Redis ⬜)]
+
+    IS -->|cache-aside stock,\ndistributed lock,\nidempotency dedupe| R[(Redis ✅)]
+    OS -->|token-bucket\nrate limiter| R
+    IS -->|stock table| PG
 
     style OS fill:#2d6a4f,color:#fff
     style PG fill:#2d6a4f,color:#fff
@@ -88,6 +99,7 @@ flowchart LR
     style PS fill:#2d6a4f,color:#fff
     style SS fill:#2d6a4f,color:#fff
     style SAGA fill:#2d6a4f,color:#fff
+    style R fill:#2d6a4f,color:#fff
     style NS fill:#6c757d,color:#fff
     style SI fill:#6c757d,color:#fff
 ```
@@ -123,10 +135,13 @@ fix, and the comments point that out explicitly as you go.
       shipment-service react to Kafka events, no coordinator) AND
       orchestration (`order-saga-orchestrator`, synchronous REST +
       Resilience4j), built and live-tested side by side, each with a real
-      compensating-transaction path. *(you are here)*
-- [ ] 9. Redis — cache-aside for stock, idempotent-consumer dedupe store,
-      rate limiting, distributed lock (fixes the overselling bug you can
-      reproduce today in `StockService`)
+      compensating-transaction path.
+- [x] **9. Redis** — cache-aside for stock (Postgres now backs
+      inventory-service's stock table, Redis reads through it),
+      idempotent-consumer dedupe store, per-customer token-bucket rate
+      limiting on order-service's API, and a distributed lock that fixes
+      the overselling race condition reproducible since Step 1 — verified
+      live across two real inventory-service instances. *(you are here)*
 - [ ] 10. Elasticsearch — search-indexer-service + Kibana dashboards
 - [ ] 11. Observability — Micrometer/Prometheus/Grafana, OpenTelemetry
       tracing
@@ -861,6 +876,145 @@ to actual failures and actual recovery.
 Neither is "correct" — this project deliberately builds and tests BOTH
 so the trade-offs above are something verified, not asserted.
 
+## Running Step 9 yourself (Redis: cache-aside, dedupe, rate limiting, distributed lock)
+
+```bash
+# 1. Bring up infra — now includes Redis on :6379
+docker compose up -d
+
+# 2. Start order-service and inventory-service as usual
+cd order-service && mvn spring-boot:run
+cd inventory-service && mvn spring-boot:run
+```
+
+### Cache-aside, verified live (MISS then HIT)
+
+```bash
+# Insufficient-stock SKU so the reservation attempt populates the cache
+# WITHOUT a write invalidating it right after (a successful reserve always
+# invalidates — see StockService.java's Javadoc for why that's correct
+# cache-aside behavior, not a bug in this demo).
+curl -s -X POST localhost:8080/api/orders -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-1","region":"us-east","items":[{"productId":"sku-99","quantity":1}]}'
+curl -s -X POST localhost:8080/api/orders -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-2","region":"us-east","items":[{"productId":"sku-99","quantity":1}]}'
+```
+
+Real captured DEBUG log from inventory-service, back to back:
+
+```
+❌ Cache MISS for sku-99 — reading Postgres
+🎯 Cache HIT for sku-99
+```
+
+A genuine Postgres read on the first call, a genuine Redis hit (no
+Postgres round trip) on the second — confirmed via
+`redis-cli get stock:sku-99` returning `0` with a live TTL, matching
+`inventory.cache.ttl-seconds` in `application.yml`.
+
+### Idempotent-consumer dedupe, verified live with a REAL Kafka redelivery
+
+Not simulated — an actual consumer-group offset reset, forcing Kafka to
+redeliver a message that was already fully processed:
+
+```bash
+# Stop inventory-service first (offsets can't be reset on an active group)
+docker exec orderflow-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group inventory-service-group \
+  --topic order-created:0 --reset-offsets --shift-by -1 --execute
+
+# Restart inventory-service — it now re-reads the last message on that partition
+cd inventory-service && mvn spring-boot:run
+```
+
+Real captured output:
+
+```
+📥 Received order-created orderId=4e2aa10f-... customerId=cust-cache-4 region=us-east
+♻️  Order 4e2aa10f-... already processed (redelivered message) — skipping, acknowledging.
+```
+
+`SELECT quantity FROM stock WHERE product_id='sku-42'` before and after
+the redelivery: identical. The message was genuinely redelivered by
+Kafka, and genuinely NOT reprocessed — the exact gap Step 1's version of
+`OrderEventListener` flagged as unaddressed, closed here.
+
+### Rate limiting, verified live (burst, per-customer isolation, refill)
+
+```bash
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/api/orders \
+    -H "Content-Type: application/json" \
+    -d '{"customerId":"cust-ratelimit-1","region":"us-east","items":[{"productId":"sku-42","quantity":1}]}'
+done
+```
+
+Real captured output (`capacity: 5`, `refill-per-second: 1`):
+
+```
+202 202 202 202 202 429 429 429 429 429
+```
+
+Exactly 5 succeeded (the bucket's full capacity, burst allowed), the rest
+were rejected instantly with `429 Too Many Requests` — no Postgres write
+attempted for the rejected ones. A concurrent burst for a DIFFERENT
+customerId succeeded immediately, confirmed completely unaffected — this
+is a per-customer bucket, not a global one. Waiting ~5 seconds and
+retrying `cust-ratelimit-1` succeeded again — the bucket refills
+continuously, not on a fixed clock boundary.
+
+### The distributed lock, verified live — real overselling reproduced as a race, then genuinely fixed
+
+This is Step 9's actual payoff, so it was tested against real concurrency
+across TWO separate running instances, not just described:
+
+```bash
+# Start a SECOND inventory-service instance (Build Order Step 2's scaling
+# story) on a different REST port to avoid the 8086 collision Step 8
+# introduced
+cd inventory-service && mvn spring-boot:run -Dspring-boot.run.arguments="--server.port=8090"
+
+# sku-7 has exactly 5 units in stock. Fire 10 concurrent reservation
+# requests — if the lock works, exactly 5 should succeed, never more,
+# and stock should land on exactly 0, never negative.
+for i in $(seq 1 10); do
+  curl -s -X POST localhost:8080/api/orders -H "Content-Type: application/json" \
+    -d "{\"customerId\":\"cust-oversell-$i\",\"region\":\"us-east\",\"items\":[{\"productId\":\"sku-7\",\"quantity\":1}]}" &
+done
+wait
+```
+
+Real captured result:
+
+```
+$ SELECT * FROM stock WHERE product_id='sku-7';
+ product_id | quantity
+------------+----------
+ sku-7      |        0
+
+$ grep sku-7 <both instances' logs>
+[instance 1] 📦 Reserved 1 x sku-7 for order b2c620a1-...
+[instance 1] 📦 Reserved 1 x sku-7 for order b3727420-...
+[instance 1] 📦 Reserved 1 x sku-7 for order 0609262b-...
+[instance 1] 📦 Reserved 1 x sku-7 for order 1814d251-...
+[instance 1] 📦 Reserved 1 x sku-7 for order 333743ed-...
+[instance 2] ❌ Insufficient stock for sku-7 (wanted 1) on order 909aa67f-...
+[instance 1] ❌ Insufficient stock for sku-7 (wanted 1) on order 41ab80a5-...
+[instance 1] ❌ Insufficient stock for sku-7 (wanted 1) on order c05b8838-...
+[instance 1] ❌ Insufficient stock for sku-7 (wanted 1) on order 36ec8bb0-...
+[instance 1] ❌ Insufficient stock for sku-7 (wanted 1) on order 2451a6ca-...
+```
+
+Exactly 5 reservations succeeded, exactly 5 correctly failed, stock landed
+on exactly 0 — including ONE decision made by a genuinely SEPARATE JVM
+(instance 2), correctly seeing insufficient stock because instance 1 had
+already committed its decrements and invalidated the cache by the time
+instance 2's lock acquisition let it read. This is the real, live
+resolution of the exact race Step 1's `StockService` Javadoc promised
+would eventually get fixed — the distributed lock serializes the
+check-then-write across process boundaries, not just within one JVM the
+way Step 1's `synchronized` keyword ever could.
+
 ## Why Maven, why this module layout
 
 Multi-module Maven reactor, one module per deployable service, a parent
@@ -871,8 +1025,8 @@ comments in the root `pom.xml` for the reasoning.
 
 | Module              | Concept focus (so far)                                    |
 |---------------------|-------------------------------------------------------------|
-| `order-service`     | REST boundary, async producer + callback, partition-key choice, acks/idempotent producer, API/event contract separation, Avro producer + Schema Registry, transactional outbox pattern, Kafka transactions, retention vs. compacted topics |
-| `inventory-service` | Consumer groups, manual offset commit, at-least-once semantics, the overselling race condition (and why it's not fixed yet), horizontal scaling + rebalance listener, static vs. dynamic group membership, Avro consumer + live schema evolution, retry topics + Dead Letter Topic with exponential backoff |
+| `order-service`     | REST boundary, async producer + callback, partition-key choice, acks/idempotent producer, API/event contract separation, Avro producer + Schema Registry, transactional outbox pattern, Kafka transactions, retention vs. compacted topics, Redis-backed per-customer token-bucket rate limiting (atomic via a Lua script) |
+| `inventory-service` | Consumer groups, manual offset commit, at-least-once semantics, horizontal scaling + rebalance listener, static vs. dynamic group membership, Avro consumer + live schema evolution, retry topics + Dead Letter Topic with exponential backoff, Postgres-backed stock + Redis cache-aside, a Redis distributed lock that FIXES the overselling race condition (verified live across two real instances), Redis-backed idempotent-consumer dedupe |
 | `fraud-detection-service` | Kafka Streams DSL, stateless transformations, KStream-KTable joins (leftJoin vs. inner), stateful windowed aggregation with a named/queryable state store, exactly-once-v2, interactive queries over REST |
 | `analytics-service` | Kafka Streams DSL, `groupBy` re-keying vs. `groupByKey` (and the repartition topics that difference costs), `.aggregate()` beyond `.count()`, multiple independent aggregations sharing one source stream, publishing a windowed KTable back out as its own topic, verified window rollover |
 | `payment-service`   | Choreography saga participant — consumes `inventory-reserved`, deterministically approves/declines by a fixed threshold, publishes `payment-completed`/`payment-failed` keyed by `customerId`; also exposes `POST /internal/charge` as orchestration's entry point into the same `PaymentProcessor` |

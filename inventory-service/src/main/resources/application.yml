@@ -25,6 +25,24 @@ spring:
   application:
     name: inventory-service
 
+  # Build Order Step 9: stock's source of truth moves from an in-memory
+  # map to Postgres, sharing order-service's DATABASE (not its tables —
+  # see schema.sql) the same way order-saga-orchestrator already does.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orderflow
+    username: orderflow
+    password: orderflow
+    driver-class-name: org.postgresql.Driver
+
+  sql:
+    init:
+      mode: always
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
   kafka:
     bootstrap-servers: localhost:9092
     consumer:
@@ -76,6 +94,34 @@ spring:
       value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
       properties:
         schema.registry.url: http://localhost:8085
+
+# Build Order Step 9 tuning knobs — externalized (rather than hardcoded
+# constants) so the live tests documented in the root README can override
+# them, same pattern as order-service's outbox.relay.poll-interval-ms.
+inventory:
+  cache:
+    # How long a cached stock count is trusted before cache-aside falls
+    # back to Postgres again, even without an explicit invalidation. A
+    # safety net for the case where something writes to stock WITHOUT
+    # going through StockService (a manual SQL UPDATE, a future admin
+    # tool) and therefore never explicitly invalidates the cache — short
+    # TTL bounds how stale a read can get in that scenario.
+    ttl-seconds: 30
+  lock:
+    # How long a distributed lock is held before it expires on its own.
+    # Must safely outlast the reserve-and-write it protects (a slow
+    # Postgres write shouldn't outlive its own lock) but short enough
+    # that a crashed lock-holder doesn't wedge a product for long. A real
+    # deployment would also watch for "held longer than expected" as an
+    # operational alert, not just rely on the TTL silently expiring.
+    ttl-ms: 5000
+  dedupe:
+    # How long an orderId is remembered as "already processed" for
+    # idempotent-consumer dedupe. Long enough to outlast any realistic
+    # redelivery window (a retry-topic hop, Build Order Step 4, plus
+    # normal consumer-group rebalance delay); not forever, so Redis
+    # doesn't accumulate one key per order ever placed.
+    ttl-hours: 24
 
 logging:
   level:

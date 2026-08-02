@@ -3,6 +3,7 @@ package com.orderflow.order.controller;
 import com.orderflow.order.dto.PlaceOrderRequest;
 import com.orderflow.order.outbox.OutboxOrderPayload;
 import com.orderflow.order.outbox.OutboxWriter;
+import com.orderflow.order.rate.TokenBucketRateLimiter;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -38,13 +39,28 @@ public class OrderController {
     private static final double FAKE_UNIT_PRICE = 9.99;
 
     private final OutboxWriter outboxWriter;
+    private final TokenBucketRateLimiter rateLimiter;
 
-    public OrderController(OutboxWriter outboxWriter) {
+    public OrderController(OutboxWriter outboxWriter, TokenBucketRateLimiter rateLimiter) {
         this.outboxWriter = outboxWriter;
+        this.rateLimiter = rateLimiter;
     }
 
     @PostMapping("/api/orders")
     public ResponseEntity<Map<String, String>> placeOrder(@Valid @RequestBody PlaceOrderRequest request) {
+        // Build Order Step 9: rate-limited PER CUSTOMER, checked before
+        // anything else — a customer over their limit shouldn't cost us
+        // a Postgres write attempt just to be told no. See
+        // TokenBucketRateLimiter's Javadoc for why this needs to be
+        // atomic and what algorithm it actually implements.
+        if (!rateLimiter.tryConsume(request.customerId())) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .body(Map.of(
+                            "status", "RATE_LIMITED",
+                            "message", "Too many orders placed too quickly for customer " + request.customerId()
+                    ));
+        }
+
         // We generate the orderId here, server-side, rather than trusting
         // a client-supplied one. This is also the natural place a REST
         // idempotency key would plug in later (Section 4, "Idempotency at
@@ -118,6 +134,11 @@ public class OrderController {
  *    Kafka event directly. Now it imports neither — the request handler
  *    is 100% Postgres, 0% Kafka. That's not a refactor for its own sake;
  *    it's the mechanism the dual-write fix depends on.
+ * 5. Build Order Step 9: rate limiting checked FIRST, before validation
+ *    even runs — a customer who's over quota shouldn't cost this service
+ *    a Bean Validation pass or a Postgres round trip just to be told no.
+ *    429 Too Many Requests, not a 4xx that implies something was wrong
+ *    with the request body itself.
  *
  * 🔧 TRY IT YOURSELF
  * curl -s -X POST localhost:8080/api/orders \
@@ -129,5 +150,9 @@ public class OrderController {
  * concrete — still true after Step 5, since it's an HTTP-layer concern,
  * completely orthogonal to whether the outbox pattern is solving the
  * Kafka side reliably.
+ *
+ * For the rate limiter specifically: fire the SAME curl command above 10
+ * times in a tight loop for the same customerId — see
+ * TokenBucketRateLimiter's own TRY IT YOURSELF for exactly what to expect.
  * ════════════════════════════════════════════════════════════════════════
  */

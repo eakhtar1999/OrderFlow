@@ -5,6 +5,7 @@ import com.orderflow.avro.InventoryReserved;
 import com.orderflow.avro.OrderCreatedEvent;
 import com.orderflow.avro.OrderItem;
 import com.orderflow.avro.ReservedItem;
+import com.orderflow.inventory.idempotency.IdempotencyStore;
 import com.orderflow.inventory.service.StockService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,10 +57,13 @@ public class OrderEventListener {
 
     private final StockService stockService;
     private final KafkaTemplate<Object, Object> kafkaTemplate;
+    private final IdempotencyStore idempotencyStore;
 
-    public OrderEventListener(StockService stockService, KafkaTemplate<Object, Object> kafkaTemplate) {
+    public OrderEventListener(StockService stockService, KafkaTemplate<Object, Object> kafkaTemplate,
+                               IdempotencyStore idempotencyStore) {
         this.stockService = stockService;
         this.kafkaTemplate = kafkaTemplate;
+        this.idempotencyStore = idempotencyStore;
     }
 
     /**
@@ -109,6 +113,20 @@ public class OrderEventListener {
         log.info("📥 Received order-created orderId={} customerId={} region={}",
                 event.getOrderId(), event.getCustomerId(), event.getRegion());
 
+        // Build Order Step 9: the idempotent-consumer half of at-least-once
+        // delivery. A redelivered message (crash after processing but
+        // before this offset committed; a retry-topic hop; a rebalance
+        // landing the same uncommitted offset on a different instance)
+        // would otherwise run tryReserve AGAIN for an order already fully
+        // handled — see IdempotencyStore's Javadoc for why the check goes
+        // here, first, before any reservation logic runs at all.
+        if (idempotencyStore.alreadyProcessed(event.getOrderId())) {
+            log.info("♻️  Order {} already processed (redelivered message) — skipping, acknowledging.",
+                    event.getOrderId());
+            acknowledgment.acknowledge();
+            return;
+        }
+
         for (OrderItem item : event.getItems()) {
             if (POISON_PRODUCT_ID.equals(item.getProductId())) {
                 // See POISON_PRODUCT_ID's Javadoc — deliberate, not a bug.
@@ -155,17 +173,19 @@ public class OrderEventListener {
             publishInventoryFailed(event);
         }
 
+        // Marked processed AFTER the decision above, same "only commit
+        // once the work is done" principle as acknowledge() itself below
+        // — see IdempotencyStore.markProcessed's Javadoc.
+        idempotencyStore.markProcessed(event.getOrderId());
+
         // We only acknowledge (commit the offset) AFTER the reservation
         // decision above has fully run. If this process crashed midway
         // through the loop, the offset would NOT be committed, and on
         // restart this exact message would be redelivered — we'd retry
         // the stock check from scratch. That's at-least-once delivery: a
         // message may be processed more than once, but never silently
-        // dropped. (Notice tryReserve isn't itself idempotent — reprocessing
-        // a message whose reservation partly succeeded before the crash
-        // could double-decrement stock. Build Order Step 9's Redis-backed
-        // idempotent-consumer pattern, deduping by orderId, is what closes
-        // that gap.)
+        // dropped — and now that reprocessing is actually SAFE, thanks to
+        // the idempotency check above, instead of just a documented gap.
         acknowledgment.acknowledge();
     }
 
@@ -243,9 +263,11 @@ public class OrderEventListener {
  *    decision of this whole file.
  * 3. Idempotent consumers are a DIFFERENT, complementary concept to
  *    at-least-once delivery: delivery guarantees are Kafka's job, but
- *    making REPROCESSING safe is your application's job. This listener
- *    doesn't do that yet (see the acknowledge() comment) — that arrives
- *    with the Redis dedupe store in Build Order Step 9.
+ *    making REPROCESSING safe is your application's job. Build Order
+ *    Step 9's IdempotencyStore check at the top of this method is that
+ *    job, done — a redelivered message now short-circuits before any
+ *    reservation logic runs, instead of silently double-decrementing
+ *    stock.
  * 4. @RetryableTopic auto-creates a SEPARATE topic per retry attempt
  *    (order-created-retry-0, -1, -2) plus one order-created-dlt, each with
  *    its OWN consumer group (inventory-service-group-retry-0, etc). Ran

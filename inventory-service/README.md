@@ -7,6 +7,13 @@ of only logging it, compensates by releasing stock when it hears a
 downstream `payment-failed`, and exposes its first-ever REST endpoints —
 the orchestration saga's entry point into this exact same stock logic.
 
+Build Order Step 9 replaces the in-memory stock map — flagged as a
+placeholder since Step 1 — with Postgres as the real source of truth, a
+Redis cache-aside layer in front of it, a Redis distributed lock that
+FIXES the overselling race condition (verified live across two real
+running instances), and a Redis-backed idempotent-consumer dedupe store
+closing the "redelivery can double-process" gap flagged since Step 1 too.
+
 ## Deep dives
 
 More get added here as the tutorial goes deeper on specific topics —
@@ -36,7 +43,10 @@ check back after later Build Order steps.
 | Consumer groups (fan-out vs. scale-out) | `consumer/OrderEventListener.java` | Same `group-id` across instances splits partitions between them (scale out); different `group-id`s each get an independent full copy (fan-out) — the mechanism every future consumer of this topic relies on |
 | Manual offset commit (`AckMode.MANUAL_IMMEDIATE`) | `config/KafkaConsumerConfig.java` | Precise control over exactly when "processed" is recorded, at the cost of writing the ack call yourself instead of trusting a timer |
 | At-least-once delivery | `consumer/OrderEventListener.java` | A crash before `acknowledge()` means safe redelivery, not silent loss — but the same message CAN be processed twice |
-| The overselling race condition | `service/StockService.java` | Deliberately reproducible today: works fine single-instance, breaks the moment you run two instances against "shared" state (each instance's map is actually separate — an even more obvious version of the bug that Redis + a distributed lock fixes in Build Order Step 9) |
+| The overselling race condition — FIXED in Build Order Step 9 | `service/StockService.java`, `lock/DistributedLock.java` | Through Step 8, reproducible: each instance's map was genuinely separate, so two instances could both "win" a reservation for the last unit. Now every instance shares the SAME Postgres `stock` table AND the check-then-write is wrapped in a Redis `SET NX PX` distributed lock — verified live across two real instances: 10 concurrent requests against 5 units of stock landed on exactly 0, never negative, with one of the 5 rejections decided by a genuinely separate JVM |
+| Cache-aside (Postgres + Redis) | `service/StockService.java` | Reads check Redis first, populate it on a miss from Postgres; writes go to Postgres and INVALIDATE the cache rather than trying to update it in place — the cost is one guaranteed cache miss right after every write, traded for never needing two code paths to agree on "the new value" |
+| Distributed lock (`SET key value NX PX ttl` + Lua compare-and-delete) | `lock/DistributedLock.java` | A single-Redis-instance simplification of real Redlock (which coordinates a MAJORITY of independent Redis nodes specifically to survive one crashing) — a real, documented trade-off: this Redis instance is now a single point of failure for reservations, not a free upgrade |
+| Idempotent-consumer dedupe store | `idempotency/IdempotencyStore.java` | A TTL-backed Redis marker keyed by orderId, checked BEFORE any reservation logic runs and set AFTER it fully completes — closes the exact gap Step 1's version of `OrderEventListener` flagged as unaddressed: a redelivered message now short-circuits instead of double-decrementing stock. Verified live with a REAL Kafka consumer-group offset reset forcing genuine redelivery, not a simulated retry |
 | **Rebalancing, made visible** (`ConsumerAwareRebalanceListener`) | `config/KafkaConsumerConfig.java` | `onPartitionsAssigned`/`Revoked`/`Lost` cost nothing at runtime — pure observability — but distinguishing a graceful REVOKED from an ungraceful LOST is exactly what you'd alert on in production |
 | Per-instance `client.id` (`${random.uuid}`) | `application.yml`, `InventoryServiceApplication.java` | Free instance identity for logs/Kafka UI once you scale out; zero config to remember per terminal |
 | Static group membership (`group.instance.id`) — discussed, not enabled | `config/KafkaConsumerConfig.java` | Would suppress rebalancing on a routine restart (good for rolling deploys) but ALSO suppresses the rebalance Step 2 wants you to see — left off by default, exercise below shows the contrast |
@@ -117,21 +127,48 @@ run it multi-instance:
     bypassing Kafka entirely — confirm it's the exact same `StockService`
     the listener uses, just reached synchronously (this is exactly what
     `order-saga-orchestrator` does).
+11. **Build Order Step 9, the overselling fix, proven not asserted**:
+    start a SECOND instance on a different REST port
+    (`-Dspring-boot.run.arguments="--server.port=8090"`), then fire 10
+    concurrent `POST /api/orders` for `sku-7` (stock=5) across different
+    `customerId`s (a bash loop with `&` and `wait`, see root README).
+    Confirm via `SELECT quantity FROM stock WHERE product_id='sku-7'`
+    that it lands on exactly 0, never negative, and that BOTH instances'
+    logs together show exactly 5 `📦 Reserved` and 5 `❌ Insufficient
+    stock` lines.
+12. Cache-aside, made visible: restart with
+    `-Dspring-boot.run.arguments="--logging.level.com.orderflow.inventory.service.StockService=DEBUG"`,
+    place an order for a product whose cache entry doesn't exist yet, and
+    watch `❌ Cache MISS ... reading Postgres` in your own logs, then
+    place another order for the SAME product and watch `🎯 Cache HIT`
+    instead — no Postgres query the second time.
+13. Idempotent-consumer dedupe, proven with a REAL redelivery: place an
+    order, let it fully process, then reset THIS consumer group's offset
+    back by one on the partition that order landed on
+    (`kafka-consumer-groups.sh --group inventory-service-group --topic
+    order-created:N --reset-offsets --shift-by -1 --execute`, group must
+    be inactive — stop this service first) and restart. Watch `♻️  ...
+    already processed ... skipping` fire instead of a second reservation,
+    and confirm stock is unchanged.
 
 ## What's deliberately NOT here yet
 
-- No real database — stock is an in-memory map that resets on restart and
-  is NOT shared across instances (Build Order Step 9 fixes both with
-  Postgres + Redis) — this also means the overselling race condition
-  above is now reachable via TWO different paths (concurrent Kafka
-  consumers, or a concurrent REST call racing a Kafka consumer), neither
-  fixed yet
 - The DLT handler only logs — no real alerting/incident-tracking
   integration yet (Build Order Step 11)
-- No idempotent-consumer dedupe — a message redelivered after a crash (or
-  reprocessed via a retry topic) can still double-decrement stock (Build
-  Order Step 9)
 - `InternalReservationController`'s endpoints have no auth/network
   restriction — in a real deployment, "internal" REST endpoints like these
   would sit behind a service mesh or network policy, not be reachable from
   wherever `order-saga-orchestrator`'s `base-url` config happens to point
+- The distributed lock is single-Redis-instance, not real Redlock — see
+  `DistributedLock.java`'s Javadoc for exactly what that trade-off means
+  (this Redis instance is a single point of failure for reservations now)
+- No cache-stampede protection — if a hot product's cache entry expires
+  (or is invalidated by a write) at the exact moment many concurrent
+  reads arrive, all of them miss and hit Postgres simultaneously rather
+  than one request repopulating the cache while others wait; the
+  distributed lock happens to serialize WRITES to the same product but
+  doesn't currently do anything for a stampede of pure reads on
+  DIFFERENT products
+- No Flyway/Liquibase for `schema.sql` — same deliberate simplification
+  order-service made in Build Order Step 5, now repeated here for the new
+  `stock` table
