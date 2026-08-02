@@ -116,6 +116,25 @@ order:
     capacity: 5
     refill-per-second: 1
 
+# Build Order Step 11: exposes ONLY /actuator/health and
+# /actuator/prometheus — actuator's default exposes far more
+# (/actuator/env, /actuator/beans, /actuator/heapdump, ...) over plain
+# HTTP with no auth, which is a real information-disclosure/DoS surface
+# in anything beyond a laptop tutorial. Naming exactly what's exposed,
+# rather than `include: "*"`, is the deliberate choice here.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    tags:
+      # Every service's metrics land in the SAME Prometheus instance —
+      # this tag is what lets a Grafana query distinguish "order-service's
+      # request latency" from "payment-service's," instead of one metric
+      # name silently mixing data from all 8 services together.
+      application: ${spring.application.name}
+
 logging:
   level:
     com.orderflow: INFO
