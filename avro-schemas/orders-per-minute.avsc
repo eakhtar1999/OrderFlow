@@ -1,0 +1,12 @@
+{
+  "type": "record",
+  "name": "OrdersPerMinute",
+  "namespace": "com.orderflow.avro",
+  "doc": "One record per closed (or still-open, re-emitted as it updates) 1-minute tumbling window, published by analytics-service's global order-count aggregation. Retention-based topic, NOT compacted — see KafkaTopicConfig.java for why a time series needs its full history kept, unlike order-status or customer-profile, which only ever needed the latest value per key.",
+
+  "fields": [
+    { "name": "windowStart", "type": "long", "doc": "Epoch millis — start of this 1-minute window." },
+    { "name": "windowEnd", "type": "long", "doc": "Epoch millis — end of this 1-minute window (windowStart + 60000)." },
+    { "name": "orderCount", "type": "long", "doc": "Total orders received across ALL customers/regions in this window." }
+  ]
+}

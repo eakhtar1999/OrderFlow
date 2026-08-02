@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "RevenueByRegion",
+  "namespace": "com.orderflow.avro",
+  "doc": "One record per (region, window) pair, published by analytics-service's per-region revenue aggregation. Same retention-not-compacted reasoning as OrdersPerMinute — a revenue time series needs its history, not just the latest window's number.",
+
+  "fields": [
+    { "name": "region", "type": "string" },
+    { "name": "windowStart", "type": "long" },
+    { "name": "windowEnd", "type": "long" },
+    { "name": "totalRevenue", "type": "double", "doc": "Sum of totalAmount across every order in this region during this window." }
+  ]
+}

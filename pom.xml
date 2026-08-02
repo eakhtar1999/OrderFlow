@@ -46,13 +46,13 @@
         directory that doesn't exist yet breaks the reactor build, so each
         module is added only when the tutorial reaches that step.
 
-        Build Order Steps 1-6 (current):
+        Build Order Steps 1-7 (current):
           - order-service
           - inventory-service
           - fraud-detection-service (Kafka Streams)
+          - analytics-service (Kafka Streams)
 
         Coming later as the tutorial progresses:
-          - analytics-service (Kafka Streams)
           - payment-service, shipment-service, order-saga-orchestrator (saga)
           - notification-service
           - search-indexer-service (Elasticsearch)
@@ -61,6 +61,7 @@
         <module>order-service</module>
         <module>inventory-service</module>
         <module>fraud-detection-service</module>
+        <module>analytics-service</module>
     </modules>
 
     <properties>

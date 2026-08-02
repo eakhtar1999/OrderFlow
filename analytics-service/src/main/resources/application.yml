@@ -1,0 +1,39 @@
+# analytics-service configuration
+
+server:
+  # order-service=8080, kafka-ui=8081 (docker), fraud-detection-service=8082
+  # — next free port for this module's own interactive-queries REST API.
+  port: 8084
+
+spring:
+  application:
+    name: analytics-service
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+    streams:
+      application-id: analytics-service
+
+      properties:
+        schema.registry.url: http://localhost:8085
+        # Same reasoning as fraud-detection-service's application.yml —
+        # one config line gets BOTH aggregations (global count AND
+        # per-region sum) the same atomicity guarantee across their
+        # repartition topics, their windowed changelogs, and their
+        # output topics, all at once.
+        processing.guarantee: exactly_once_v2
+        default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+
+# Window size for BOTH aggregations in this module. 1 minute, deliberately
+# short — long enough to be a believable "per minute" metric, short
+# enough that you can actually watch a window close and a fresh one start
+# during a normal test session instead of waiting an unreasonable amount
+# of real time.
+analytics:
+  window-size-seconds: 60
+
+logging:
+  level:
+    com.orderflow: INFO
+    org.apache.kafka.streams: INFO
