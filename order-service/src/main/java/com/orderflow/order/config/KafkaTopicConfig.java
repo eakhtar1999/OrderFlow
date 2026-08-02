@@ -45,10 +45,11 @@ public class KafkaTopicConfig {
                 // for why that matters).
                 .partitions(3)
                 // Replication factor 1 because our docker-compose runs a
-                // single broker for this tutorial step. In production this
-                // would be 3, so losing one broker doesn't lose data — see
-                // the root README's "ISR / leader election" section for
-                // where we simulate that failure later in the build order.
+                // single broker. In production this would be 3, so losing
+                // one broker doesn't lose data — but a single-broker
+                // cluster has no second replica to fail over TO, so this
+                // project never actually simulates that failure. Flagged,
+                // not demonstrated — see docs/system-design.md §8.
                 .replicas(1)
                 .build();
     }
@@ -95,8 +96,8 @@ public class KafkaTopicConfig {
  *    command once and nobody remembers the settings."
  * 2. Partition count is a real capacity-planning decision with trade-offs
  *    (parallelism vs. ordering vs. per-broker overhead), not a default you
- *    ignore. Section 4 of the root README ("Hot partition simulation")
- *    revisits this exact bean.
+ *    ignore. The hot-partition risk this creates for a per-customer key
+ *    (docs/system-design.md §7.1) is discussed there, not fixed here.
  * 3. Replication factor is Kafka's core durability knob — it's what "ISR"
  *    (in-sync replicas) governs. RF=1 has zero fault tolerance; we call
  *    that out explicitly rather than hiding it.

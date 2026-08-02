@@ -17,6 +17,10 @@ interactive rebase, PR review, and the merge-vs-squash-vs-rebase
 decision) using this repo's own real history as worked examples, plus a
 git/GitHub reference section and an interview-style Q&A at the end.
 
+For the requirements/architecture/trade-offs view of this whole project
+— what got built, what got deliberately scoped out, and why — see
+[`docs/system-design.md`](docs/system-design.md).
+
 ## Where we are right now
 
 **Build Order Steps 1–11 are done:** `order-service` publishes to Kafka;
@@ -219,8 +223,18 @@ fix, and the comments point that out explicitly as you go.
       explicit `KAFKA_LOG_DIRS` override, then verified live: recreated
       the Kafka container a second time and confirmed all 17 topics (plus
       registered Avro schemas) survived without any service needing to
-      recreate them. *(you are here)*
-- [ ] 13. System design doc — requirements, architecture, trade-offs
+      recreate them.
+- [x] **13. System design doc** — requirements, architecture diagrams
+      (system + one order's full data flow), a `claude.md`-vs-reality
+      traceability table for every Kafka/system-design concept, a
+      trade-offs deep dive (partition key choice, choreography vs.
+      orchestration, exactly-once vs. at-least-once, outbox vs. Debezium,
+      retention vs. compaction, pessimistic vs. optimistic concurrency),
+      and — matching this whole project's stated honesty bar — a
+      dedicated "known gaps" section naming exactly what `claude.md` asks
+      for that never got built (no automated tests anywhere being the
+      biggest one). See
+      [`docs/system-design.md`](docs/system-design.md). *(you are here)*
 
 ## Running Step 1 yourself
 
