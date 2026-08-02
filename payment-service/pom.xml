@@ -48,6 +48,23 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- Build Order Step 14 — see order-service/pom.xml's comment.
+             No Postgres/Redis module needed here: payment-service is
+             stateless (a fixed threshold rule, no database of its own),
+             so Kafka is the only real infrastructure its integration
+             test needs. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- Build Order Step 11 — see order-service/pom.xml's comment. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>

@@ -89,6 +89,20 @@
              a third-party project, not a Spring one), so pinned
              explicitly here like avro/confluent above. -->
         <resilience4j.version>2.2.0</resilience4j.version>
+        <!-- Build Order Step 14: overrides spring-boot-starter-parent's
+             own managed Testcontainers version (1.19.8) — that release's
+             bundled docker-java client sends its initial Docker-daemon
+             probe against an old, hardcoded API version path
+             (/v1.24/info) that this machine's Docker Desktop responds to
+             with a malformed, empty-fields 200 that Testcontainers reads
+             as "no valid Docker environment," even though `docker info`
+             and `docker compose` both work fine directly. A newer
+             Testcontainers/docker-java release negotiates the API
+             version instead of hardcoding one, which is the actual fix —
+             found live, by curling the raw Docker socket at both
+             /v1.24/info (broken) and /info (fine) to isolate exactly
+             which request was failing. -->
+        <testcontainers.version>1.21.4</testcontainers.version>
     </properties>
 
     <!-- kafka-avro-serializer / kafka-schema-registry-client aren't on

@@ -85,6 +85,30 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- Build Order Step 14: real Kafka + Postgres + Redis in Docker,
+             not H2/embedded-Kafka stand-ins — see
+             CoreOrderFlowIntegrationTest's Javadoc for why that distinction
+             matters (an embedded broker can't reproduce the KAFKA_LOG_DIRS
+             class of bug Build Order Step 12 found). Versions come from
+             spring-boot-starter-parent's own dependency management, the
+             same way every other dependency in this file does. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- Build Order Step 11: /actuator/prometheus exposes every
              Micrometer metric this JVM has registered — JVM memory/GC,
              HTTP request latency (auto-instrumented for every
