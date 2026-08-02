@@ -1,13 +1,15 @@
 # ════════════════════════════════════════════════════════════════════════
 # OrderFlow infrastructure.
 #
-# This file grows alongside the Build Order in the root README — it is NOT
-# meant to spin up the entire target architecture (section 8 of claude.md)
-# on day one. Only what Step 1 needs is active below. Everything else is
-# left in as a COMMENTED-OUT block, in the shape it'll eventually take,
-# so you can see the whole target infrastructure and uncomment it exactly
-# when the tutorial reaches that step. Uncommenting infra you don't have
-# code for yet just wastes laptop RAM.
+# This file grew alongside the Build Order in the root README, one infra
+# block uncommented per step, exactly when the code that needed it
+# existed — never the whole target architecture (section 8 of claude.md)
+# on day one, since uncommenting infra you don't have code for yet just
+# wastes laptop RAM. As of Build Order Step 12, this history is complete:
+# every block below is active and genuinely used by at least one service.
+# `git log -p docker-compose.yml` (or just the root README's own
+# Step-by-step walkthroughs) shows the actual order each piece was
+# uncommented in, if you want to see it grow the way it originally did.
 #
 # Run: docker compose up -d
 # Stop: docker compose down            (add -v to also wipe topic data)
@@ -44,6 +46,20 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Found live, Build Order Step 12: without this, apache/kafka:3.8.0
+      # actually writes its log segments to /tmp/kafka-logs, NOT
+      # /var/lib/kafka/data — meaning the `kafka-data` volume below was
+      # mounted at the WRONG path for this image's real default, and
+      # every topic + every consumer-group offset had been silently
+      # non-persistent (surviving only as long as one container instance
+      # stayed up) for this entire project, undetected until a true
+      # cold-start test (`docker compose down` with no `-v`, then `up -d`
+      # again) came back with zero application topics — confirmed via
+      # `docker exec orderflow-kafka find / -iname kafka-logs`, which
+      # located the real, actively-written directory. KAFKA_LOG_DIRS
+      # explicitly points log.dirs at the SAME path the volume below is
+      # mounted to, closing the gap.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
       - kafka-data:/var/lib/kafka/data
     healthcheck:
@@ -70,9 +86,13 @@ services:
       - kafka
 
   # ════════════════════════════════════════════════════════════════════
-  # Everything below is FUTURE infrastructure — not started yet.
-  # Uncomment each block when the root README's Build Order reaches the
-  # step named next to it.
+  # Build Order Step 12: this file now genuinely runs the FULL target
+  # infrastructure — every service below is active, not a future
+  # placeholder. Only kafka-connect (Debezium, the outbox-relay
+  # ALTERNATIVE this project deliberately didn't build — see the root
+  # README's comparison table) stays commented out, on purpose, as a
+  # worked example of "here's exactly what you'd add if you wanted to
+  # try the other approach."
   # ════════════════════════════════════════════════════════════════════
 
   # ── Schema Registry (Build Order Step 3: Avro + Schema Registry) ────
