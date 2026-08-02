@@ -33,6 +33,16 @@ spring:
       properties:
         schema.registry.url: http://localhost:8085
 
+# Build Order Step 11 — see order-service/application.yml's comment.
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
 logging:
   level:
     com.orderflow: INFO

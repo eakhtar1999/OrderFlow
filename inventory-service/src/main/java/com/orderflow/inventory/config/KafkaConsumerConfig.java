@@ -4,6 +4,7 @@ import com.orderflow.avro.OrderCreatedEvent;
 import io.confluent.kafka.serializers.AbstractKafkaSchemaSerDeConfig;
 import io.confluent.kafka.serializers.KafkaAvroDeserializer;
 import io.confluent.kafka.serializers.KafkaAvroDeserializerConfig;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.TopicPartition;
@@ -16,6 +17,7 @@ import org.springframework.kafka.annotation.EnableKafka;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.core.MicrometerConsumerListener;
 import org.springframework.kafka.listener.ConsumerAwareRebalanceListener;
 import org.springframework.kafka.listener.ContainerProperties;
 
@@ -75,8 +77,26 @@ public class KafkaConsumerConfig {
         return clientId;
     }
 
+    /**
+     * Build Order Step 11: {@code addListener(new
+     * MicrometerConsumerListener<>(...))} is the one line this hand-built
+     * factory was MISSING for consumer-lag metrics to show up in
+     * Prometheus — found live by comparing this service's
+     * `/actuator/prometheus` output against payment-service's. Spring
+     * Boot's OWN auto-configured {@code ConsumerFactory} bean gets this
+     * wiring automatically the moment a {@code MeterRegistry} bean
+     * exists in the context; that automatic wiring is exactly what
+     * {@code @ConditionalOnMissingBean} auto-configuration backs off
+     * from the instant a module defines its OWN
+     * {@code ConsumerFactory} bean, which is precisely what this class
+     * has done since Build Order Step 2 (to control AckMode explicitly —
+     * see the class Javadoc). A real, previously invisible cost of that
+     * choice: you also opt out of every piece of automatic wiring
+     * Spring Boot would otherwise have provided, observability included,
+     * and have to explicitly ask for each one back.
+     */
     @Bean
-    public ConsumerFactory<String, OrderCreatedEvent> consumerFactory() {
+    public ConsumerFactory<String, OrderCreatedEvent> consumerFactory(MeterRegistry meterRegistry) {
         Map<String, Object> props = new HashMap<>();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
@@ -126,14 +146,17 @@ public class KafkaConsumerConfig {
         // (incorrectly) that the record was already handled.
         props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
 
-        return new DefaultKafkaConsumerFactory<>(props);
+        DefaultKafkaConsumerFactory<String, OrderCreatedEvent> factory = new DefaultKafkaConsumerFactory<>(props);
+        factory.addListener(new MicrometerConsumerListener<>(meterRegistry));
+        return factory;
     }
 
     @Bean
-    public ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent> kafkaListenerContainerFactory() {
+    public ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent> kafkaListenerContainerFactory(
+            MeterRegistry meterRegistry) {
         ConcurrentKafkaListenerContainerFactory<String, OrderCreatedEvent> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
-        factory.setConsumerFactory(consumerFactory());
+        factory.setConsumerFactory(consumerFactory(meterRegistry));
 
         // MANUAL_IMMEDIATE: the listener method must call
         // acknowledgment.acknowledge() itself, and doing so commits that
@@ -235,6 +258,16 @@ public class KafkaConsumerConfig {
  *    rebalancing" for "no rebalancing on a routine restart" — a real
  *    production concern (rolling deploys) that Step 2 deliberately leaves
  *    off so the concept it's teaching stays visible. See TRY IT YOURSELF.
+ * 6. Build Order Step 11: hand-building a ConsumerFactory bean (done
+ *    here since Step 2, to control AckMode) opts OUT of every piece of
+ *    automatic wiring Spring Boot's own auto-configured ConsumerFactory
+ *    would otherwise provide — consumer-lag Micrometer metrics included.
+ *    Found live by comparing this service's /actuator/prometheus output
+ *    against payment-service's (which uses the auto-configured factory
+ *    and had lag metrics with zero extra code): this class was missing
+ *    exactly one line, `addListener(new MicrometerConsumerListener<>(...))`.
+ *    A real, previously invisible cost of reaching for a hand-built
+ *    bean instead of the default.
  *
  * 🔧 TRY IT YOURSELF
  * 1. Change AckMode to AckMode.RECORD (auto-commit-like, offset advances

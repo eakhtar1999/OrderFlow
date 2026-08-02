@@ -65,6 +65,21 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Build Order Step 11 — see order-service/pom.xml's comment.
+             Also gives Resilience4j's own circuit-breaker/retry state
+             (call counts, failure rates, state transitions) a Micrometer
+             binding automatically, via resilience4j-micrometer already
+             on this module's classpath — see the root README's Step 8
+             circuit-breaker walkthrough for the exact events this
+             surfaces as metrics instead of just log lines. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

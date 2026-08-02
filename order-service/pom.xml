@@ -85,6 +85,23 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Build Order Step 11: /actuator/prometheus exposes every
+             Micrometer metric this JVM has registered — JVM memory/GC,
+             HTTP request latency (auto-instrumented for every
+             @RestController), Kafka producer/consumer internals
+             (including consumer LAG, Spring Kafka's Micrometer binder
+             registers this automatically once a MeterRegistry bean
+             exists), Kafka transaction metrics — in Prometheus's own
+             text exposition format, scraped every 5s (see
+             observability/prometheus/prometheus.yml). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
     </dependencies>
 
     <build>

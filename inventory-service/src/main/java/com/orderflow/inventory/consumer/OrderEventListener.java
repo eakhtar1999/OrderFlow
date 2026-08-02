@@ -7,6 +7,8 @@ import com.orderflow.avro.OrderItem;
 import com.orderflow.avro.ReservedItem;
 import com.orderflow.inventory.idempotency.IdempotencyStore;
 import com.orderflow.inventory.service.StockService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.DltHandler;
@@ -58,12 +60,24 @@ public class OrderEventListener {
     private final StockService stockService;
     private final KafkaTemplate<Object, Object> kafkaTemplate;
     private final IdempotencyStore idempotencyStore;
+    private final Counter dltMessagesCounter;
 
     public OrderEventListener(StockService stockService, KafkaTemplate<Object, Object> kafkaTemplate,
-                               IdempotencyStore idempotencyStore) {
+                               IdempotencyStore idempotencyStore, MeterRegistry meterRegistry) {
         this.stockService = stockService;
         this.kafkaTemplate = kafkaTemplate;
         this.idempotencyStore = idempotencyStore;
+        // Build Order Step 11: claude.md's "dead-letter-topic alerting
+        // story" question — "what happens operationally when messages
+        // land in DLT" — answered with a real metric instead of only a
+        // log line nobody's necessarily watching. A production alert
+        // rule would fire on `rate(inventory_dlt_messages_total[5m]) > 0`
+        // — not built here (Grafana's own alerting needs a notification
+        // channel this tutorial has no email/Slack/PagerDuty target
+        // for), but the metric this alert would query on already exists.
+        this.dltMessagesCounter = Counter.builder("inventory.dlt.messages")
+                .description("Messages that exhausted all retry attempts and landed on the Dead Letter Topic")
+                .register(meterRegistry);
     }
 
     /**
@@ -245,6 +259,7 @@ public class OrderEventListener {
     ) {
         log.error("💀 DEAD LETTER: order {} from topic '{}' exhausted all retry attempts — {}",
                 event.getOrderId(), originalTopic, exceptionMessage);
+        dltMessagesCounter.increment();
     }
 }
 

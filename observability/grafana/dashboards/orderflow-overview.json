@@ -1,0 +1,86 @@
+{
+  "title": "OrderFlow — Overview",
+  "uid": "orderflow-overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Kafka Consumer Lag (max per instance)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "kafka_consumer_fetch_manager_records_lag_max, one series per consumer client — a real, first-class monitored metric (claude.md's own phrase), not a Kafka UI screenshot you have to remember to check.",
+      "targets": [
+        {
+          "expr": "kafka_consumer_fetch_manager_records_lag_max",
+          "legendFormat": "{{application}} / {{client_id}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "HTTP Request Rate by Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "rate() of http_server_requests_seconds_count, auto-instrumented for every @RestController by spring-boot-starter-actuator — zero manual counter code anywhere in this project.",
+      "targets": [
+        {
+          "expr": "sum by (application) (rate(http_server_requests_seconds_count[1m]))",
+          "legendFormat": "{{application}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "HTTP Error Rate (5xx) by Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "Same metric as the panel above, filtered to 5xx status codes — the rate limiter's own 429s (Build Order Step 9) are 4xx, deliberately NOT counted here, since a client being correctly rate-limited isn't a server error.",
+      "targets": [
+        {
+          "expr": "sum by (application) (rate(http_server_requests_seconds_count{status=~\"5..\"}[1m]))",
+          "legendFormat": "{{application}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Kafka Listener Throughput by Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "rate() of spring_kafka_listener_seconds_count — how many Kafka records per second each service's @KafkaListener methods are actually processing, combined across every listener in that service.",
+      "targets": [
+        {
+          "expr": "sum by (application) (rate(spring_kafka_listener_seconds_count[1m]))",
+          "legendFormat": "{{application}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Dead-Lettered Messages (total)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "Prometheus" },
+      "description": "inventory.dlt.messages_total — claude.md's 'dead-letter-topic alerting story,' made real: a message landing in order-created-dlt (Build Order Step 4) now increments a Micrometer counter instead of only producing a log line nobody's watching.",
+      "targets": [
+        {
+          "expr": "inventory_dlt_messages_total",
+          "legendFormat": "{{application}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
