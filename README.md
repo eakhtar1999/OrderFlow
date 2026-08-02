@@ -9,7 +9,13 @@ code to run — treat each file as a lesson with a lab attached.
 
 This repo is built incrementally, following the Build Order below. Each
 step is a real git-history-worthy milestone: a working, demonstrable
-increment, not a half-finished sketch of the next one.
+increment, not a half-finished sketch of the next one. Since Step 10,
+that also means a real feature branch + pull request per step — see
+[`docs/git-github-workflow.md`](docs/git-github-workflow.md) for a full
+staged walkthrough of that workflow (branching, committing, an actual
+interactive rebase, PR review, and the merge-vs-squash-vs-rebase
+decision) using this repo's own real history as worked examples, plus a
+git/GitHub reference section and an interview-style Q&A at the end.
 
 ## Where we are right now
 
