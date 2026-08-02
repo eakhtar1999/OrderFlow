@@ -13,7 +13,7 @@ increment, not a half-finished sketch of the next one.
 
 ## Where we are right now
 
-**Build Order Steps 1–9 are done:** `order-service` publishes to Kafka;
+**Build Order Steps 1–10 are done:** `order-service` publishes to Kafka;
 `inventory-service` consumes, checks in-memory stock, and logs a
 reservation decision (Step 1) — scales horizontally with a rebalance
 listener that logs partition hand-off as instances join, leave, or crash
@@ -47,7 +47,13 @@ closes the overselling race condition that was reproducible since Step 1
 idempotent-consumer dedupe store makes message redelivery actually safe
 instead of just documented as unsafe, and order-service's REST API is now
 rate-limited per customer with a token bucket implemented as an atomic
-Redis Lua script (Step 9). Everything else below is roadmap.
+Redis Lua script (Step 9) — and a new `search-indexer-service` now builds
+one denormalized Elasticsearch document per order from `order-created`
+plus all five saga events via partial-update upserts, answering faceted
+searches ("orders for customer X in region Y with status Z") no single
+existing service could, plus a second independent consumer feeding
+analytics-service's windowed aggregates into Elasticsearch for Kibana
+(Step 10). Everything else below is roadmap.
 
 ## Target architecture
 
@@ -64,7 +70,7 @@ flowchart LR
     K --> NS[notification-service ⬜]
     K --> FD[fraud-detection-service ✅\nKafka Streams]
     K --> AN[analytics-service ✅\nKafka Streams]
-    K --> SI[search-indexer-service ⬜]
+    K --> SI[search-indexer-service ✅]
 
     CP[(customer-profile ✅\ncompacted, seeded manually)] -.->|KTable join| FD
     FD -->|fraud-alerts| K
@@ -75,6 +81,7 @@ flowchart LR
     SS -->|shipment-created| K
     K -->|payment-failed\ncompensation| IS
     K -->|every saga event\n-> order-status| OS
+    K -->|order-created +\nall 5 saga events| SI
 
     Client2([Client]) -->|POST /api/saga/orders\norchestration saga, blocks\nuntil the saga finishes| SAGA[order-saga-orchestrator ✅\nResilience4j Retry+CircuitBreaker]
     SAGA -->|1: reserve / release\nREST, synchronous| IS
@@ -82,8 +89,11 @@ flowchart LR
     SAGA -->|3: ship\nREST, synchronous| SS
     SAGA -->|saga state| PG2[(Postgres ✅\nsaga table)]
 
-    SI --> ES[(Elasticsearch ⬜)]
-    AN -.->|Build Order Step 10| ES
+    SI -->|denormalized order docs,\npartial-update upserts| ES[(Elasticsearch ✅)]
+    AN -->|orders-per-minute,\nrevenue-by-region| K
+    K -->|windowed aggregates| SI
+    ES --> KIB[Kibana ✅]
+    Client3([Client]) -->|GET /api/search/orders\nfaceted search| SI
 
     IS -->|cache-aside stock,\ndistributed lock,\nidempotency dedupe| R[(Redis ✅)]
     OS -->|token-bucket\nrate limiter| R
@@ -100,8 +110,10 @@ flowchart LR
     style SS fill:#2d6a4f,color:#fff
     style SAGA fill:#2d6a4f,color:#fff
     style R fill:#2d6a4f,color:#fff
+    style SI fill:#2d6a4f,color:#fff
+    style ES fill:#2d6a4f,color:#fff
+    style KIB fill:#2d6a4f,color:#fff
     style NS fill:#6c757d,color:#fff
-    style SI fill:#6c757d,color:#fff
 ```
 
 ✅ = built · ⬜ = planned (see Build Order). Two separate client entry
@@ -141,8 +153,17 @@ fix, and the comments point that out explicitly as you go.
       idempotent-consumer dedupe store, per-customer token-bucket rate
       limiting on order-service's API, and a distributed lock that fixes
       the overselling race condition reproducible since Step 1 — verified
-      live across two real inventory-service instances. *(you are here)*
-- [ ] 10. Elasticsearch — search-indexer-service + Kibana dashboards
+      live across two real inventory-service instances.
+- [x] **10. Elasticsearch** — `search-indexer-service` builds one
+      denormalized order document per orderId from `order-created` plus
+      all five saga events, via partial-update upserts; `GET
+      /api/search/orders` answers faceted queries no other service can;
+      a second consumer feeds analytics-service's windowed aggregates
+      into Elasticsearch for Kibana. Two real bugs found and fixed live:
+      an index-mapping gap (annotations silently ignored until an
+      explicit index initializer existed) and a genuine concurrent-writer
+      version conflict under backfill load, fixed with Elasticsearch's
+      own retry-on-conflict. *(you are here)*
 - [ ] 11. Observability — Micrometer/Prometheus/Grafana, OpenTelemetry
       tracing
 - [ ] 12. Full docker-compose + per-module READMEs mapping code to
@@ -1015,6 +1036,140 @@ would eventually get fixed — the distributed lock serializes the
 check-then-write across process boundaries, not just within one JVM the
 way Step 1's `synchronized` keyword ever could.
 
+## Running Step 10 yourself (Elasticsearch + Kibana)
+
+```bash
+# 1. Bring up infra — now includes Elasticsearch on :9200 and Kibana on :5601
+docker compose up -d
+
+# 2. Start every service as usual, plus the new one
+cd order-service && mvn spring-boot:run
+cd inventory-service && mvn spring-boot:run
+cd payment-service && mvn spring-boot:run
+cd shipment-service && mvn spring-boot:run
+cd analytics-service && mvn spring-boot:run
+cd search-indexer-service && mvn spring-boot:run    # :8090
+```
+
+### The denormalized order document, verified live end to end
+
+```bash
+curl -s -X POST localhost:8080/api/orders -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-search-fresh2","region":"us-east","items":[{"productId":"sku-42","quantity":1}]}'
+```
+
+A few seconds later, real captured output:
+
+```bash
+$ curl localhost:9200/orders/_doc/f9646e02-.../pretty
+{
+  "_version": 4,
+  "_source": {
+    "items": [{"productId": "sku-42", "quantity": 1}],
+    "status": "SHIPPED",
+    "region": "us-east",
+    "orderId": "f9646e02-...",
+    "customerId": "cust-search-fresh2",
+    "createdAt": 1785661737241,
+    "totalAmount": 9.99,
+    "updatedAt": 1785661737431,
+    "shipmentId": "SHIP-aa7c341c-..."
+  }
+}
+```
+
+`_version: 4` — four separate partial merges (order-created,
+inventory-reserved, payment-completed, shipment-created), each one a
+DIFFERENT Kafka listener, none of them coordinating with each other,
+Elasticsearch doing the merge server-side every time.
+
+### Faceted search, verified live
+
+```bash
+curl -s "localhost:8090/api/search/orders?region=us-east&status=SHIPPED"
+curl -s "localhost:8090/api/search/orders?customerId=cust-search-fresh2"
+curl -s "localhost:8090/api/search/orders?status=PAYMENT_FAILED"
+```
+
+Each returned exactly the matching orders, combining filters correctly —
+including a `PAYMENT_FAILED` query correctly showing `reason` populated
+and `shipmentId` absent, confirming the sparse-document design (see
+`OrderDocument`'s Javadoc) behaves as intended for orders that never
+reached that stage.
+
+### Two real bugs, found live, fixed live
+
+**Bug 1 — `@Field(type = Keyword)` annotations were silently doing
+nothing.** `GET localhost:9200/orders/_mapping` came back showing
+`customerId`, `region`, `status` etc. as `text` with a bolted-on
+`.keyword` sub-field — Elasticsearch's own dynamic-mapping default for
+an unmapped string, not what the annotations asked for. Root cause: this
+service's very first write is a partial `UpdateQuery`
+(`docAsUpsert(true)`), which auto-creates the index with dynamic mapping
+on first contact — Spring Data Elasticsearch only applies
+annotation-derived mappings through its own index-creation path (e.g.
+`ElasticsearchRepository`), which this service never goes through since
+it writes via the lower-level `ElasticsearchOperations` API directly.
+Fixed with `ElasticsearchIndexInitializer`, an `ApplicationRunner` that
+explicitly creates each index with its annotation-derived mapping BEFORE
+any Kafka listener gets a chance to write to it.
+
+**Bug 2 — a genuine HTTP 409 under real concurrency.** Verifying the
+mapping fix meant deleting the (wrongly-mapped) indices and resetting
+this service's consumer group to `earliest`, which fires a burst of
+near-simultaneous writes across all SIX listener threads for every
+historical order at once. Real captured exception:
+
+```
+Caused by: org.springframework.dao.DataAccessResourceFailureException:
+method [POST], host [http://localhost:9200], URI [/orders/_update/b57e8c98-.../...],
+status line [HTTP/1.1 409 Conflict]
+{"error":{"root_cause":[{"type":"version_conflict_engine_exception",
+"reason":"[b57e8c98-...]: version conflict, document already exists (current version [1])", ...
+```
+
+`docAsUpsert` alone isn't safe under real concurrent writers to the SAME
+document — Elasticsearch's optimistic concurrency control correctly
+detected the document changed between one listener's read and its write.
+Fixed with `.withRetryOnConflict(3)` on the `UpdateQuery`, telling
+Elasticsearch to retry the merge server-side instead of surfacing the
+race as a hard failure — the exact same CLASS of problem the Redis
+distributed lock solves in inventory-service (Build Order Step 9),
+solved here with Elasticsearch's own built-in retry mechanism instead of
+an application-level lock. Re-ran the full backfill after the fix: zero
+errors.
+
+### A found, NOT fixed, limitation: cross-topic reordering during a cold replay
+
+The same backfill that surfaced Bug 2 above also surfaced something we
+chose to document rather than fix. One historical order's document ended
+up STUCK showing `status: CREATED` despite that order having actually
+shipped, real evidence:
+
+```bash
+$ curl localhost:9200/orders/_doc/b57e8c98-.../pretty
+{ "status": "CREATED", ... }   # this order actually reached SHIPPED, hours earlier
+```
+
+In normal live operation, `order-created` always arrives before any
+downstream saga event for the same order — nothing downstream can even
+exist yet. But Kafka only guarantees ordering WITHIN a topic-partition,
+never ACROSS different topics, and `order-created`'s listener
+unconditionally writes `status: CREATED` on every upsert. During the
+backfill, this order's `shipment-created` event happened to be consumed
+and merged BEFORE its `order-created` event (six independent listener
+threads, six independent topics, racing to catch up), so the LATER
+`order-created` write silently regressed the status backward — and
+because this was a replay of already-completed history, nothing will
+ever arrive to correct it. Verified this is a replay-only issue, not a
+live-traffic bug, by placing fresh orders in steady state and confirming
+they always reach the correct final status (see the `_version: 4`
+example above). The professional fix — a scripted conditional update
+comparing each write's own timestamp against the document's currently
+stored `updatedAt`, no-op'ing on anything older — is flagged in
+`search-indexer-service/README.md` rather than built, since it's a real
+step up in complexity for what is specifically a cold-replay edge case.
+
 ## Why Maven, why this module layout
 
 Multi-module Maven reactor, one module per deployable service, a parent
@@ -1032,6 +1187,7 @@ comments in the root `pom.xml` for the reasoning.
 | `payment-service`   | Choreography saga participant — consumes `inventory-reserved`, deterministically approves/declines by a fixed threshold, publishes `payment-completed`/`payment-failed` keyed by `customerId`; also exposes `POST /internal/charge` as orchestration's entry point into the same `PaymentProcessor` |
 | `shipment-service`  | Choreography saga's terminal step — consumes `payment-completed`, always succeeds (a deliberate scope boundary, see `ShipmentCreator`'s Javadoc), publishes `shipment-created`; also exposes `POST /internal/ship` for orchestration |
 | `order-saga-orchestrator` | Orchestration-based saga — one `SagaOrchestrator` class contains the entire sequence + compensation logic explicitly, calling inventory/payment/shipment-service synchronously over `RestClient`, each call wrapped in Resilience4j `@CircuitBreaker` + `@Retry`; saga state lives in its own Postgres `saga` table |
+| `search-indexer-service` | CQRS read model — one denormalized Elasticsearch document per order, built by six independent Kafka listeners via partial-update upserts; a faceted search REST endpoint; a second consumer feeding Kibana from analytics-service's aggregates; two real Elasticsearch bugs found and fixed live (index-mapping gap, concurrent-writer version conflicts) |
 | `avro-schemas`      | The single source of truth event contract — not a Java module, just the `.avsc` files every service's `avro-maven-plugin` codegen from independently |
 
 Each module also has its own `README.md` — read that first if you're
