@@ -1,0 +1,24 @@
+{
+  "type": "record",
+  "name": "CustomerProfile",
+  "namespace": "com.orderflow.avro",
+  "doc": "Reference data fraud-detection-service reads as a KTable (see FraudDetectionTopology.java) and joins against every incoming order — the classic 'enrich a stream with slowly-changing reference data' pattern. There's no customer-service in this tutorial yet, so this topic is seeded directly by seed/CustomerProfileSeeder.java rather than produced by a real upstream service — a deliberate stand-in, documented as such rather than pretended away. Log-compacted (see KafkaTopicConfig.java) for the same reason order-status is: only the LATEST profile per customerId matters for a join, not the history of how it changed.",
+
+  "fields": [
+    {
+      "name": "customerId",
+      "type": "string",
+      "doc": "The join key — must match OrderCreatedEvent.customerId exactly for the KStream-KTable join to find a match."
+    },
+    {
+      "name": "riskTier",
+      "type": "string",
+      "doc": "NEW, TRUSTED, or BLOCKLISTED, as a plain string rather than an Avro enum — same reasoning as OrderStatus.status: a closed enum bakes the exact set of values into the schema itself, making adding a new tier later a schema-compatibility question instead of just a new string appearing in the data."
+    },
+    {
+      "name": "updatedAt",
+      "type": "long",
+      "doc": "Epoch milliseconds — consistent representation choice with every other timestamp field in this project."
+    }
+  ]
+}

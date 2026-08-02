@@ -1,0 +1,81 @@
+# fraud-detection-service configuration
+
+server:
+  # order-service uses 8080, Kafka UI already occupies 8081 on the host —
+  # this is the first service in the repo with its OWN REST endpoint
+  # (interactive queries) that isn't order-service, so it needs its own
+  # free port.
+  port: 8082
+
+spring:
+  application:
+    name: fraud-detection-service
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+    streams:
+      # Doubles as both the Kafka Streams "application ID" AND the
+      # consumer group ID for every internal consumer this topology
+      # creates — one string, two jobs. It's also the prefix Kafka
+      # Streams puts on every internal topic it creates for itself
+      # (repartition topics, the windowed-count changelog backing
+      # order-velocity-store) — go looking for topics named
+      # "fraud-detection-service-..." in Kafka UI once this is running.
+      application-id: fraud-detection-service
+
+      properties:
+        schema.registry.url: http://localhost:8085
+
+        # THE headline feature of this file. Kafka Streams' "exactly-once
+        # v2" processing guarantee wraps EVERY read-process-write cycle
+        # in this entire topology — both branches, the KTable join, the
+        # windowed aggregation's changelog writes, all of it — in Kafka
+        # transactions automatically. Compare this ONE line to
+        # OutboxRelay.java's hand-written beginTransaction/send/
+        # commitTransaction dance from Build Order Step 5, spanning just
+        # TWO sends: this config line gets you the equivalent guarantee
+        # across an entire multi-stage topology, for free, because Kafka
+        # Streams already knows the full shape of what it's reading,
+        # transforming, and writing.
+        processing.guarantee: exactly_once_v2
+
+        # Keys are customerId strings everywhere in this topology (see
+        # FraudDetectionTopology.java) — safe to default globally. Value
+        # serdes are NOT defaulted here on purpose: different stages
+        # produce different Avro types (OrderCreatedEvent,
+        # CustomerProfile, FraudAlert, plain Longs for counts), and
+        # spelling out each one explicitly in code, at the call site
+        # that needs it, is more honest than one default that would only
+        # be right some of the time.
+        default.key.serde: org.apache.kafka.common.serialization.Serdes$StringSerde
+
+    # Still used for the customer-profile seeder's plain KafkaTemplate
+    # (see seed/CustomerProfileSeeder.java) — a completely separate
+    # producer from the Streams topology above, same as order-service's
+    # producer config predates and is unrelated to inventory-service's
+    # consumer config.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      properties:
+        schema.registry.url: http://localhost:8085
+
+# Business rule thresholds — deliberately NOT hardcoded inside
+# FraudDetectionTopology.java, so you can retune them (or override via
+# environment variables) without recompiling. See that class for how
+# each one is used.
+fraud:
+  high-value:
+    threshold-amount: 200.0
+  velocity:
+    window-minutes: 5
+    threshold-count: 3
+
+logging:
+  level:
+    com.orderflow: INFO
+    # Kafka Streams logs its own topology description + rebalancing at
+    # startup — genuinely useful the first few times you run this, noisy
+    # after that. Bump to DEBUG if you want to see it.
+    org.apache.kafka.streams: INFO

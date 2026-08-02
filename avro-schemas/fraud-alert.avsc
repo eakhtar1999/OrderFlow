@@ -1,0 +1,22 @@
+{
+  "type": "record",
+  "name": "FraudAlert",
+  "namespace": "com.orderflow.avro",
+  "doc": "Published by fraud-detection-service's topology onto the fraud-alerts topic whenever EITHER of its two independent detection branches fires — see FraudDetectionTopology.java for both. A retention-based topic, not compacted: this is a log of every alert ever raised, and unlike order-status, there's no 'current state per key' question here worth optimizing for — you want the full history of what got flagged and why.",
+
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    {
+      "name": "reason",
+      "type": "string",
+      "doc": "One of HIGH_VALUE, BLOCKLISTED_CUSTOMER, or ORDER_VELOCITY — which branch of the topology produced this alert. A real system would likely make this an Avro enum once the full rule set stabilizes; kept a string here for the same forward-compatibility reason as OrderStatus.status and CustomerProfile.riskTier."
+    },
+    {
+      "name": "severity",
+      "type": "string",
+      "doc": "LOW, MEDIUM, or HIGH — a human/downstream-system priority signal, independent of `reason`."
+    },
+    { "name": "detectedAt", "type": "long" }
+  ]
+}

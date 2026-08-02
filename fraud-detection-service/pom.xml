@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.orderflow</groupId>
+        <artifactId>orderflow</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>fraud-detection-service</artifactId>
+    <name>fraud-detection-service</name>
+    <description>
+        OrderFlow's first Kafka Streams application. Scores every order in
+        real time for two independent fraud signals — one stateless
+        (single-record rules), one stateful (per-customer order velocity,
+        windowed) — and exposes the live velocity counts for interactive
+        querying over REST. Everything here processes order-created;
+        nothing here is a plain @KafkaListener consumer like
+        inventory-service — this module speaks the Kafka Streams DSL
+        instead.
+    </description>
+
+    <dependencies>
+        <!-- For the interactive-queries REST endpoint only — this module
+             is a Kafka Streams app first, a REST API second. See
+             query/FraudQueryController.java. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Gives us @EnableKafkaStreams and Spring's StreamsBuilderFactoryBean
+             — the glue that turns a StreamsBuilder-based topology definition
+             into a managed KafkaStreams lifecycle (start/stop with the
+             Spring context, health, etc). Also brings spring-kafka's own
+             @KafkaListener support, unused here — every other module in
+             this repo already depends on it, kept for consistency and in
+             case a plain listener is ever added alongside the topology. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
+        <!-- The actual Kafka Streams library — DSL (KStream, KTable,
+             StreamsBuilder), not part of spring-kafka itself. -->
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-streams</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>${avro.version}</version>
+        </dependency>
+
+        <!-- NOT kafka-avro-serializer (that's for plain KafkaProducer/
+             KafkaConsumer, used in order-service and inventory-service).
+             Kafka Streams needs a Serde<T> — a serializer+deserializer
+             PAIR bundled as one object, because the DSL needs both
+             directions for the same type (reading a topic into a KTable,
+             re-serializing an aggregation result, etc). This artifact is
+             what provides SpecificAvroSerde. -->
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-streams-avro-serde</artifactId>
+            <version>${confluent.version}</version>
+        </dependency>
+
+        <!-- Same producer used for the customer-profile seeder
+             (see seed/CustomerProfileSeeder.java) — a plain
+             KafkaTemplate, not part of the Streams topology itself. -->
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-avro-serializer</artifactId>
+            <version>${confluent.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-streams-test-utils</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>fraud-detection-service</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- Generates THIS module's own copies of every class in
+                 /avro-schemas — including OrderCreatedEvent, which this
+                 module only ever READS (order-service and inventory-
+                 service already generate the same class independently;
+                 see their pom.xml comments for why that's by design, not
+                 duplication we forgot to clean up). -->
+            <plugin>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro-maven-plugin</artifactId>
+                <version>${avro.version}</version>
+                <executions>
+                    <execution>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>schema</goal>
+                        </goals>
+                        <configuration>
+                            <sourceDirectory>${project.basedir}/../avro-schemas</sourceDirectory>
+                            <outputDirectory>${project.build.directory}/generated-sources/avro</outputDirectory>
+                            <stringType>String</stringType>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
