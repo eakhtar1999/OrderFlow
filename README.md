@@ -13,7 +13,7 @@ increment, not a half-finished sketch of the next one.
 
 ## Where we are right now
 
-**Build Order Steps 1–10 are done:** `order-service` publishes to Kafka;
+**Build Order Steps 1–11 are done:** `order-service` publishes to Kafka;
 `inventory-service` consumes, checks in-memory stock, and logs a
 reservation decision (Step 1) — scales horizontally with a rebalance
 listener that logs partition hand-off as instances join, leave, or crash
@@ -53,7 +53,19 @@ plus all five saga events via partial-update upserts, answering faceted
 searches ("orders for customer X in region Y with status Z") no single
 existing service could, plus a second independent consumer feeding
 analytics-service's windowed aggregates into Elasticsearch for Kibana
-(Step 10). Everything else below is roadmap.
+(Step 10) — and every service is now genuinely observable instead of
+just logging to a terminal nobody's watching: Micrometer + Prometheus
+metrics on all 8 services (consumer lag as a first-class monitored
+metric, exactly as claude.md asks — including a real gap found and fixed
+live, where inventory-service's hand-built consumer factory was silently
+missing the lag binding every OTHER service got for free), a committed
+Grafana dashboard provisioned automatically on startup, a real Prometheus
+counter closing the "dead-letter-topic alerting story" instead of only a
+log line, and OpenTelemetry distributed tracing via the Java
+auto-instrumentation agent — verified live with a single trace spanning
+all 7 downstream services and 51 spans for ONE order, trace context
+correctly propagated through Kafka headers the whole way (Step 11).
+Everything else below is roadmap.
 
 ## Target architecture
 
@@ -99,6 +111,12 @@ flowchart LR
     OS -->|token-bucket\nrate limiter| R
     IS -->|stock table| PG
 
+    OS -.->|/actuator/prometheus\nall 8 services scraped| PROM[(Prometheus ✅)]
+    IS -.->|same| PROM
+    PROM --> GRAF[Grafana ✅\nprovisioned dashboard]
+    OS -.->|OTLP spans, via\nJava agent, all 8 services| JAEGER[Jaeger ✅]
+    IS -.->|trace context via\nKafka headers| JAEGER
+
     style OS fill:#2d6a4f,color:#fff
     style PG fill:#2d6a4f,color:#fff
     style PG2 fill:#2d6a4f,color:#fff
@@ -113,11 +131,17 @@ flowchart LR
     style SI fill:#2d6a4f,color:#fff
     style ES fill:#2d6a4f,color:#fff
     style KIB fill:#2d6a4f,color:#fff
+    style PROM fill:#2d6a4f,color:#fff
+    style GRAF fill:#2d6a4f,color:#fff
+    style JAEGER fill:#2d6a4f,color:#fff
     style NS fill:#6c757d,color:#fff
 ```
 
-✅ = built · ⬜ = planned (see Build Order). Two separate client entry
-points on purpose — choreography (`order-service`) and orchestration
+✅ = built · ⬜ = planned (see Build Order). The two Prometheus/Jaeger
+arrows shown are representative — in reality ALL 8 services are scraped
+and ALL 8 export traces; drawing all 16 arrows would make the diagram
+unreadable. Two separate client entry points on purpose — choreography
+(`order-service`) and orchestration
 (`order-saga-orchestrator`) run side by side, never touching the same
 order, so you can compare them directly. See "Running Step 8 yourself"
 below.
@@ -163,9 +187,18 @@ fix, and the comments point that out explicitly as you go.
       an index-mapping gap (annotations silently ignored until an
       explicit index initializer existed) and a genuine concurrent-writer
       version conflict under backfill load, fixed with Elasticsearch's
-      own retry-on-conflict. *(you are here)*
-- [ ] 11. Observability — Micrometer/Prometheus/Grafana, OpenTelemetry
-      tracing
+      own retry-on-conflict.
+- [x] **11. Observability** — Micrometer + Prometheus on all 8 services
+      (consumer lag as a first-class metric), a committed/provisioned
+      Grafana dashboard, a real DLT-alerting counter, and OpenTelemetry
+      distributed tracing via the Java auto-instrumentation agent —
+      verified live with a single trace spanning all 7 downstream
+      services (51 spans) for one order, propagated correctly through
+      Kafka headers the whole way. Two real gaps found and fixed live:
+      inventory-service's hand-built ConsumerFactory was silently missing
+      Micrometer's lag binding, and Grafana's file-based dashboard
+      provisioner only scans once at container startup, not on the
+      documented polling interval. *(you are here)*
 - [ ] 12. Full docker-compose + per-module READMEs mapping code to
       concepts
 - [ ] 13. System design doc — requirements, architecture, trade-offs
@@ -1170,6 +1203,131 @@ stored `updatedAt`, no-op'ing on anything older — is flagged in
 `search-indexer-service/README.md` rather than built, since it's a real
 step up in complexity for what is specifically a cold-replay edge case.
 
+## Running Step 11 yourself (Micrometer/Prometheus/Grafana + OpenTelemetry/Jaeger)
+
+```bash
+# 1. Bring up infra — now includes Prometheus on :9090, Grafana on :3000
+#    (admin/orderflow), Jaeger on :16686
+docker compose up -d
+
+# 2. One-time: download the OpenTelemetry Java agent. NOT committed to
+#    this repo (a 24MB downloaded binary, not source) — see .gitignore.
+#    Downloaded outside the project directory on purpose too: if YOUR
+#    own path has spaces in it (this one does — "System Design Notes"),
+#    -javaagent's path gets mis-split by Maven's jvmArguments parsing,
+#    a real gotcha found live building this step.
+mkdir -p ~/.otel
+curl -sL -o ~/.otel/opentelemetry-javaagent.jar \
+  https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
+
+# 3. Start every service WITH the agent attached, e.g. order-service:
+AGENT=~/.otel/opentelemetry-javaagent.jar
+cd order-service && mvn spring-boot:run \
+  -Dspring-boot.run.jvmArguments="-javaagent:$AGENT -Dotel.service.name=order-service -Dotel.traces.exporter=otlp -Dotel.metrics.exporter=none -Dotel.logs.exporter=none -Dotel.exporter.otlp.protocol=grpc -Dotel.exporter.otlp.endpoint=http://localhost:4317"
+# Repeat for every other service, swapping only otel.service.name.
+```
+
+### Metrics, verified live across all 8 services
+
+```bash
+for port in 8080 8082 8084 8086 8087 8088 8089 8090; do
+  curl -s -o /dev/null -w "%{http_code}\n" "http://localhost:$port/actuator/prometheus"
+done
+# -> 200, all 8
+```
+
+`curl localhost:9090/api/v1/targets` confirmed all 8 jobs `"health":"up"`.
+
+### A real bug, found live: inventory-service was silently missing consumer-lag metrics
+
+Comparing `payment-service`'s `/actuator/prometheus` output (full
+`kafka_consumer_*` metric family, lag included, zero extra code) against
+`inventory-service`'s (only `spring_kafka_listener_seconds`, nothing
+else) exposed a real gap. Root cause: `inventory-service` hand-builds its
+own `ConsumerFactory` bean (Build Order Step 2, to control AckMode
+explicitly) — Spring Boot's automatic Micrometer-Kafka wiring only
+applies to ITS OWN auto-configured `ConsumerFactory`, and backs off
+entirely via `@ConditionalOnMissingBean` the instant a module defines
+its own bean. Fixed with one line —
+`factory.addListener(new MicrometerConsumerListener<>(meterRegistry))`
+— restoring the exact metric family every other service got for free.
+Real captured evidence, before and after:
+
+```
+# before the fix
+$ curl localhost:8086/actuator/prometheus | grep -c kafka_consumer_fetch_manager
+0
+
+# after
+$ curl localhost:8086/actuator/prometheus | grep kafka_consumer_fetch_manager_records_lag_max
+kafka_consumer_fetch_manager_records_lag_max{application="inventory-service",...} 0.0
+```
+
+### The provisioned Grafana dashboard
+
+Open `localhost:3000` (admin/orderflow) — the "OrderFlow — Overview"
+dashboard is already there, never clicked together by hand: it's
+`observability/grafana/dashboards/orderflow-overview.json`, committed to
+this repo and auto-loaded on container start. Five panels: Kafka
+consumer lag, HTTP request rate by service, HTTP 5xx error rate by
+service, Kafka listener throughput by service, and dead-lettered message
+count.
+
+**A second real finding, also fixed live:** Grafana's file-based
+dashboard provisioner only scans its mounted folder ONCE, at container
+startup — adding the dashboard JSON to the already-running container's
+mounted directory did NOT make it appear, despite
+`updateIntervalSeconds: 30` in the provisioning config. `docker restart
+orderflow-grafana` was the actual fix; confirmed via `curl
+localhost:3000/api/search?query=OrderFlow` returning empty before the
+restart, populated after.
+
+### The DLT counter, verified live with a real poison message
+
+```bash
+curl -s -X POST localhost:8080/api/orders -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-dlt-metric-test","region":"us-east","items":[{"productId":"sku-poison","quantity":1}]}'
+# wait ~8s for the full 1s/2s/4s retry backoff (Build Order Step 4) to exhaust
+curl -s localhost:8086/actuator/prometheus | grep inventory_dlt_messages_total
+```
+
+Real captured result: `inventory_dlt_messages_total{application="inventory-service"} 1.0`
+— went from absent to `1.0` the moment the message actually landed on
+`order-created-dlt`, confirmed against the same log timestamp.
+
+### Distributed tracing, verified live — the actual payoff of this whole step
+
+Placed one order through the full choreography saga with all 8 services
+running under the OTel agent, then queried Jaeger for the resulting
+trace. Real captured result: **one trace ID, 51 spans, all 7 downstream
+services, 2.4 seconds end to end** — trace context propagated correctly
+through Kafka message headers the entire way, not just across the one
+synchronous HTTP hop:
+
+```
+   0.00ms  [order-service          ] OutboxRelay.publishPendingOutboxRows
+   5.97ms  [order-service          ] order-created publish
+  85.67ms  [inventory-service      ] order-created process
+  97.57ms  [inventory-service      ] EXISTS                    (idempotency check, Redis)
+ 108.08ms  [inventory-service      ] UPDATE orderflow.stock     (Postgres)
+ 112.00ms  [inventory-service      ] EVALSHA                    (distributed lock's Lua script)
+ 113.61ms  [inventory-service      ] inventory-reserved publish
+ 226.60ms  [search-indexer-service ] order-created process      (parallel fan-out consumer)
+ 337.18ms  [payment-service        ] inventory-reserved process
+ 370.51ms  [payment-service        ] payment-completed publish
+ 623.69ms  [shipment-service       ] payment-completed process
+ 647.00ms  [shipment-service       ] shipment-created publish
+1346.51ms  [analytics-service      ] order-created process       (Kafka Streams, own consumer group)
+2428.87ms  [fraud-detection-service] order-created process       (Kafka Streams, own consumer group)
+```
+
+Every one of claude.md's independent Kafka consumers of `order-created`
+— the choreography saga, `search-indexer-service`, both Kafka Streams
+apps — shows up under the SAME trace, purely because trace context rides
+along in Kafka headers automatically once the agent is attached. Nobody
+wrote a single line of tracing code anywhere in this project; every span
+above (HTTP, Kafka produce/consume, JDBC, Redis) is auto-instrumented.
+
 ## Why Maven, why this module layout
 
 Multi-module Maven reactor, one module per deployable service, a parent
@@ -1189,6 +1347,11 @@ comments in the root `pom.xml` for the reasoning.
 | `order-saga-orchestrator` | Orchestration-based saga — one `SagaOrchestrator` class contains the entire sequence + compensation logic explicitly, calling inventory/payment/shipment-service synchronously over `RestClient`, each call wrapped in Resilience4j `@CircuitBreaker` + `@Retry`; saga state lives in its own Postgres `saga` table |
 | `search-indexer-service` | CQRS read model — one denormalized Elasticsearch document per order, built by six independent Kafka listeners via partial-update upserts; a faceted search REST endpoint; a second consumer feeding Kibana from analytics-service's aggregates; two real Elasticsearch bugs found and fixed live (index-mapping gap, concurrent-writer version conflicts) |
 | `avro-schemas`      | The single source of truth event contract — not a Java module, just the `.avsc` files every service's `avro-maven-plugin` codegen from independently |
+| `observability`     | Not a Java module — Prometheus scrape config, Grafana provisioning + a committed dashboard JSON, all plain config files applying to every service above simultaneously (Build Order Step 11) |
 
 Each module also has its own `README.md` — read that first if you're
-starting on that specific service.
+starting on that specific service. Every service ALSO shares two
+cross-cutting Build Order Step 11 additions not called out per-row
+above: Micrometer + Prometheus metrics (`/actuator/prometheus`) and
+OpenTelemetry distributed tracing via the Java agent — see "Running
+Step 11 yourself" below.
