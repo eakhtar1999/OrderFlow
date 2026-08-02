@@ -204,9 +204,22 @@ fix, and the comments point that out explicitly as you go.
       inventory-service's hand-built ConsumerFactory was silently missing
       Micrometer's lag binding, and Grafana's file-based dashboard
       provisioner only scans once at container startup, not on the
-      documented polling interval. *(you are here)*
-- [ ] 12. Full docker-compose + per-module READMEs mapping code to
-      concepts
+      documented polling interval.
+- [x] **12. Full docker-compose + per-module READMEs mapping code to
+      concepts** — every block in `docker-compose.yml` is now active
+      infrastructure genuinely used by at least one service (only
+      Debezium/kafka-connect stays commented out, on purpose, as the
+      outbox-relay alternative this project deliberately didn't build).
+      A true cold-start test (`docker compose down` with no `-v`, then
+      `up -d` again) surfaced a real bug: the `kafka-data` volume was
+      mounted at `/var/lib/kafka/data`, but `apache/kafka:3.8.0` actually
+      writes its log segments to `/tmp/kafka-logs` by default — meaning
+      every topic and every consumer-group offset had been silently
+      non-persistent, for the entire project, until now. Fixed with an
+      explicit `KAFKA_LOG_DIRS` override, then verified live: recreated
+      the Kafka container a second time and confirmed all 17 topics (plus
+      registered Avro schemas) survived without any service needing to
+      recreate them. *(you are here)*
 - [ ] 13. System design doc — requirements, architecture, trade-offs
 
 ## Running Step 1 yourself
@@ -1333,6 +1346,118 @@ apps — shows up under the SAME trace, purely because trace context rides
 along in Kafka headers automatically once the agent is attached. Nobody
 wrote a single line of tracing code anywhere in this project; every span
 above (HTTP, Kafka produce/consume, JDBC, Redis) is auto-instrumented.
+
+## Running Step 12 yourself (full docker-compose, verified cold)
+
+```bash
+# 1. A true cold start — not just `up -d` on top of already-running
+#    containers. Down WITHOUT -v (named volumes survive; this is the
+#    normal restart path, not a data-wipe)
+docker compose down
+docker compose up -d
+
+# 2. Confirm all 10 infra containers are healthy
+docker compose ps
+```
+
+### A real bug, found live: the Kafka data volume was mounted at the wrong path
+
+The very first cold-start check — list topics right after a fresh
+`down`/`up` cycle — came back suspicious:
+
+```bash
+docker exec orderflow-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+# -> __consumer_offsets
+# -> _schemas
+#    (every application topic — order-created, inventory-reserved,
+#    order-status, all 15 of them — just gone)
+```
+
+`docker-compose.yml` has mounted a named volume to `/var/lib/kafka/data`
+since Step 1, specifically so topic data would survive container
+restarts. Checking the volume directly showed why that never worked:
+
+```bash
+docker run --rm -v ordernow_kafka-data:/data alpine ls -la /data
+# -> empty
+```
+
+Tracing the actually-running container found the real log directory:
+
+```bash
+docker exec orderflow-kafka find / -maxdepth 3 -iname "*kafka-logs*"
+# -> /tmp/kafka-logs
+docker exec orderflow-kafka ls -la /tmp/kafka-logs/
+# -> __cluster_metadata-0, __consumer_offsets-*, ... all there
+```
+
+`apache/kafka:3.8.0`'s own default `log.dirs` is `/tmp/kraft-combined-logs`
+(later observed to resolve to `/tmp/kafka-logs` at runtime) — a
+completely different, unmounted path from the one this file's `volumes:`
+block targeted. Every topic and every consumer-group offset had been
+silently non-persistent across container recreations for this entire
+project; only staying alive as long as one container instance did.
+
+Fixed with one explicit environment variable that points `log.dirs` at
+the SAME path the volume is already mounted to:
+
+```yaml
+kafka:
+  environment:
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+  volumes:
+    - kafka-data:/var/lib/kafka/data
+```
+
+### The fix, verified live — recreate Kafka a second time, nothing recreated by the apps this time
+
+```bash
+# Recreate ONLY the kafka container (not the whole stack) — the volume
+# itself is untouched either way, this isolates the test to "does the
+# broker find its old data on the SAME volume after a fresh container?"
+docker compose stop kafka && docker compose rm -f kafka && docker compose up -d kafka
+
+docker exec orderflow-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list
+# -> all 17 topics present — customer-profile, fraud-alerts,
+#    inventory-failed, inventory-reserved, order-created (+ its
+#    retry/DLT topics), order-status, orders-per-minute,
+#    payment-completed, payment-failed, revenue-by-region,
+#    shipment-created — NOT recreated by any Spring Boot service this
+#    time, they were already on disk.
+```
+
+One secondary wrinkle surfaced by the same test: `schema-registry`
+wasn't restarted alongside `kafka`, so its in-memory subject cache went
+stale (`GET /subjects` returned `[]` even though the underlying
+`_schemas` topic's raw data had survived — confirmed separately with
+`kafka-console-consumer --topic _schemas --from-beginning`). A plain
+`docker restart orderflow-schema-registry` resynced it. This isn't a bug
+in this project's config — it's normal Kafka-client behavior (a
+transactional producer's existing producer-ID also briefly hit
+`InvalidPidMappingException` on the very next order placed after the
+broker recreation, for the same reason: the broker is a fresh process
+even though its log data isn't). Both self-heal; the schema-registry
+restart just made the self-heal visible immediately instead of waiting
+for its next natural reconnect.
+
+End-to-end confirmation, placing a real order after the fix:
+
+```bash
+curl -s -X POST localhost:8080/api/orders \
+  -H "Content-Type: application/json" \
+  -d '{"customerId":"cust-1","region":"us-east","items":[{"productId":"sku-42","quantity":2}]}'
+
+curl -s http://localhost:8085/subjects
+# -> ["order-created-value","order-status-value"]
+
+curl -s http://localhost:9200/orders/_doc/<orderId>
+# -> found: true, status: "SHIPPED", shipmentId set — the full
+#    choreography saga ran, and search-indexer-service's document is
+#    live in Elasticsearch, on infrastructure that was JUST torn down
+#    and rebuilt from nothing but its named volumes.
+```
 
 ## Why Maven, why this module layout
 
