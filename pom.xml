@@ -46,7 +46,7 @@
         directory that doesn't exist yet breaks the reactor build, so each
         module is added only when the tutorial reaches that step.
 
-        Build Order Step 1 (current):
+        Build Order Steps 1-3 (current):
           - order-service
           - inventory-service
 
@@ -64,6 +64,28 @@
     <properties>
         <java.version>21</java.version>
         <!-- Spring Boot's parent manages the actual spring-kafka version -->
+
+        <!-- Build Order Step 3: Avro + Schema Registry. Pinned here, once,
+             so order-service and inventory-service — which each generate
+             their OWN Java classes from the same .avsc file, see
+             /avro-schemas — can never drift onto incompatible codegen or
+             client versions the way the hand-copied DTOs could before. -->
+        <avro.version>1.11.3</avro.version>
+        <!-- Confluent's platform version, not Kafka's — cp-schema-registry
+             in docker-compose.yml and kafka-avro-serializer below are
+             pinned to the SAME Confluent release for a reason: Confluent's
+             wire-format and client libraries version together. -->
+        <confluent.version>7.7.0</confluent.version>
     </properties>
+
+    <!-- kafka-avro-serializer / kafka-schema-registry-client aren't on
+         Maven Central — Confluent publishes them from their own repo.
+         Declared once here so no child module has to repeat it. -->
+    <repositories>
+        <repository>
+            <id>confluent</id>
+            <url>https://packages.confluent.io/maven/</url>
+        </repository>
+    </repositories>
 
 </project>

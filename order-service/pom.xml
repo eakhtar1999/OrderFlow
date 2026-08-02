@@ -37,6 +37,25 @@
             <artifactId>spring-kafka</artifactId>
         </dependency>
 
+        <!-- Avro runtime: SpecificRecordBase and friends, which every class
+             avro-maven-plugin generates below (see build/plugins) extends. -->
+        <dependency>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>${avro.version}</version>
+        </dependency>
+
+        <!-- Confluent's KafkaAvroSerializer: wraps each record with a
+             5-byte magic-byte + schema-id header (NOT the schema itself —
+             that's the whole point) and talks to Schema Registry over
+             HTTP to register/look up schema ids, with a local cache so
+             it's not a network call per message. -->
+        <dependency>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-avro-serializer</artifactId>
+            <version>${confluent.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
@@ -50,6 +69,38 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- Generates com.orderflow.avro.OrderCreatedEvent (and its
+                 nested OrderItem) from ../avro-schemas/order-created.avsc
+                 into target/generated-sources/avro at build time. Every
+                 module that needs the type points this SAME plugin at the
+                 SAME schema file and generates its OWN copy of the class —
+                 no shared JAR between services, just a shared source file
+                 and, at runtime, a shared registry that enforces they stay
+                 compatible. -->
+            <plugin>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro-maven-plugin</artifactId>
+                <version>${avro.version}</version>
+                <executions>
+                    <execution>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>schema</goal>
+                        </goals>
+                        <configuration>
+                            <sourceDirectory>${project.basedir}/../avro-schemas</sourceDirectory>
+                            <outputDirectory>${project.build.directory}/generated-sources/avro</outputDirectory>
+                            <!-- Generate java.lang.String fields instead of
+                                 Avro's own Utf8 CharSequence type — Utf8 is
+                                 marginally faster but every downstream
+                                 equals()/instanceof String check in our own
+                                 code would otherwise need to account for it. -->
+                            <stringType>String</stringType>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

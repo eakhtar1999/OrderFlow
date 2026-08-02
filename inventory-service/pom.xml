@@ -30,17 +30,25 @@
             <artifactId>spring-kafka</artifactId>
         </dependency>
 
-        <!-- JsonDeserializer needs Jackson's databind + JSR-310 module to
-             deserialize order-created's plain-JSON payload, including its
-             java.time fields. Both retired in Build Order Step 3 once
-             Avro replaces hand-copied JSON DTOs entirely. -->
+        <!-- Build Order Step 3 retires the two Jackson dependencies that
+             used to live here (jackson-databind, jackson-datatype-jsr310)
+             — both were needed only because JsonDeserializer used Jackson
+             under the hood. KafkaAvroDeserializer (below) doesn't touch
+             Jackson at all. -->
+
         <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
+            <groupId>org.apache.avro</groupId>
+            <artifactId>avro</artifactId>
+            <version>${avro.version}</version>
         </dependency>
+
+        <!-- Same artifact as order-service's producer side — it bundles
+             both KafkaAvroSerializer and KafkaAvroDeserializer, and this
+             module only uses the latter. -->
         <dependency>
-            <groupId>com.fasterxml.jackson.datatype</groupId>
-            <artifactId>jackson-datatype-jsr310</artifactId>
+            <groupId>io.confluent</groupId>
+            <artifactId>kafka-avro-serializer</artifactId>
+            <version>${confluent.version}</version>
         </dependency>
 
         <dependency>
@@ -56,6 +64,30 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- Generates THIS module's own com.orderflow.avro.OrderCreatedEvent
+                 from the SAME ../avro-schemas/order-created.avsc file
+                 order-service generates from — see that module's pom.xml
+                 for the full explanation of why each service generates
+                 its own copy instead of sharing a compiled jar. -->
+            <plugin>
+                <groupId>org.apache.avro</groupId>
+                <artifactId>avro-maven-plugin</artifactId>
+                <version>${avro.version}</version>
+                <executions>
+                    <execution>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>schema</goal>
+                        </goals>
+                        <configuration>
+                            <sourceDirectory>${project.basedir}/../avro-schemas</sourceDirectory>
+                            <outputDirectory>${project.build.directory}/generated-sources/avro</outputDirectory>
+                            <stringType>String</stringType>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>

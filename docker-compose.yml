@@ -76,19 +76,38 @@ services:
   # ════════════════════════════════════════════════════════════════════
 
   # ── Schema Registry (Build Order Step 3: Avro + Schema Registry) ────
-  # schema-registry:
-  #   image: confluentinc/cp-schema-registry:7.7.0
-  #   container_name: orderflow-schema-registry
-  #   ports:
-  #     - "8085:8085"
-  #   environment:
-  #     SCHEMA_REGISTRY_HOST_NAME: schema-registry
-  #     SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8085
-  #     SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
-  #     SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
-  #   depends_on:
-  #     kafka:
-  #       condition: service_healthy
+  # Confluent's Schema Registry: a small HTTP service backed by its own
+  # Kafka topic (_schemas) that stores every version of every schema ever
+  # registered, keyed by "subject" (by default: "<topic>-value"). Its job
+  # isn't just storage — every time a producer tries to register a NEW
+  # version of a schema, the registry runs a COMPATIBILITY CHECK against
+  # the previous version(s) and REJECTS the write if it would break an
+  # existing consumer. That check is the entire value proposition over
+  # "just hand-copy the DTO and hope" from Build Order Steps 1-2.
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.0
+    container_name: orderflow-schema-registry
+    ports:
+      - "8085:8085"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8085
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      # BACKWARD (the default) means: a NEW schema version must be
+      # readable by consumers still running the PREVIOUS version — safe
+      # to upgrade consumers before producers. Explicit here because
+      # which compatibility mode you pick changes what changes are even
+      # allowed; see the root README's schema evolution walkthrough for
+      # what this rejects vs. allows in practice.
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8085/subjects || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
 
   # ── Postgres (Build Order Step 5: outbox pattern; Step 9: real stock) ─
   # postgres:

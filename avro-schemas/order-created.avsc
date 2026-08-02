@@ -1,0 +1,52 @@
+{
+  "type": "record",
+  "name": "OrderCreatedEvent",
+  "namespace": "com.orderflow.avro",
+  "doc": "The single source of truth for the order-created event contract. Build Order Step 1/2 had EACH service hand-copy this shape into its own Java class — order-service's event.OrderCreatedEvent and inventory-service's model.OrderCreatedEvent, kept in sync purely by convention. This file replaces both: every service's avro-maven-plugin generates its OWN Java class from THIS one file, and Schema Registry rejects any future version of this file that would break a consumer still running the previous one. Same 'no shared JVM module between services' property as before (see the old classes' Javadoc) — just with the drift risk actually closed instead of just documented.",
+
+  "fields": [
+    {
+      "name": "orderId",
+      "type": "string",
+      "doc": "Server-generated UUID from order-service's OrderController."
+    },
+    {
+      "name": "customerId",
+      "type": "string",
+      "doc": "Also the Kafka partition key (see OrderEventProducer) — unrelated to Avro, kept for the ordering-vs-parallelism trade-off explained there."
+    },
+    {
+      "name": "region",
+      "type": "string"
+    },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "OrderItem",
+          "fields": [
+            { "name": "productId", "type": "string" },
+            { "name": "quantity", "type": "int" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "totalAmount",
+      "type": "double"
+    },
+    {
+      "name": "createdAt",
+      "type": "long",
+      "doc": "Epoch milliseconds (Instant.toEpochMilli()), not Avro's timestamp-millis logical type. That logical type auto-converts to java.time.Instant in generated code, which IS convenient — but the exact conversion behavior depends on the Avro codegen version and configuration in ways that are easy to get subtly wrong on your own machine. Storing a plain long and converting explicitly in code (see OrderController and OrderEventListener) is more verbose but leaves nothing implicit. Try the logical-type version yourself once this baseline works (see this module's TRY IT YOURSELF)."
+    },
+    {
+      "name": "giftMessage",
+      "type": "string",
+      "default": "",
+      "doc": "Added AFTER order-created-value v1 was already registered and live — a real, live schema evolution, not a hypothetical. The `default` is what makes this BACKWARD compatible: a consumer still running the OLD generated class simply never asks for this field (Avro's schema resolution just drops it), and if we ever needed the reverse — an old-shaped message read by a NEW reader — the default fills the gap. Verified live: see the root README's schema evolution walkthrough for the actual before/after log output from both sides."
+    }
+  ]
+}
