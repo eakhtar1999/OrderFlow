@@ -1,0 +1,51 @@
+# Build Order Step 11. Prometheus runs INSIDE docker-compose's network;
+# every OrderFlow service runs directly on the host (`mvn spring-boot:run`,
+# never containerized in this tutorial) — so scrape targets use
+# host.docker.internal, Docker Desktop's DNS name for "the machine
+# running Docker," not `localhost` (which, from inside this container,
+# would mean the Prometheus container itself) and not a service name on
+# the compose network (these services were never added to it).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: order-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+
+  - job_name: fraud-detection-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8082"]
+
+  - job_name: analytics-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8084"]
+
+  - job_name: inventory-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8086"]
+
+  - job_name: payment-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8087"]
+
+  - job_name: shipment-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8088"]
+
+  - job_name: order-saga-orchestrator
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8089"]
+
+  - job_name: search-indexer-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8090"]
