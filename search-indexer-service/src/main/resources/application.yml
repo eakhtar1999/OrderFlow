@@ -1,0 +1,37 @@
+# search-indexer-service configuration
+
+server:
+  # order-service=8080, fraud-detection=8082, analytics=8084,
+  # schema-registry=8085 (docker), inventory-service=8086,
+  # payment-service=8087, shipment-service=8088,
+  # order-saga-orchestrator=8089, this=8090.
+  port: 8090
+
+spring:
+  application:
+    name: search-indexer-service
+
+  elasticsearch:
+    uris: http://localhost:9200
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      # One consumer group for everything this service reads — six
+      # different topics, one logical "build the order document" job.
+      # See OrderDocumentIndexer.java for why six @KafkaListener methods
+      # sharing one group-id don't compete with each other (same
+      # reasoning as order-service's OrderStatusUpdater, Build Order
+      # Step 8: Kafka tracks committed offsets per (group, topic,
+      # partition), not per group alone).
+      group-id: search-indexer-service-group
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: io.confluent.kafka.serializers.KafkaAvroDeserializer
+      properties:
+        schema.registry.url: http://localhost:8085
+        specific.avro.reader: true
+
+logging:
+  level:
+    com.orderflow: INFO
