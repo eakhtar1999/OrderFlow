@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "InventoryReserved",
+  "namespace": "com.orderflow.avro",
+  "doc": "Published by inventory-service once every item on an order has been successfully reserved. Build Order Step 8's saga events all follow the same design rule: carry forward everything the NEXT step needs (region, items, totalAmount), not just an orderId a consumer would have to re-query for. Contrast with a 'thin event' design (just orderId + a status flag) — that would be smaller on the wire but couples every downstream consumer to being able to look order details back up somewhere, which nothing in this platform currently offers.",
+
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "region", "type": "string" },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "ReservedItem",
+          "fields": [
+            { "name": "productId", "type": "string" },
+            { "name": "quantity", "type": "int" }
+          ]
+        }
+      }
+    },
+    { "name": "totalAmount", "type": "double" },
+    { "name": "reservedAt", "type": "long" }
+  ]
+}

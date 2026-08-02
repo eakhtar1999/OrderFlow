@@ -5,6 +5,22 @@
 # AckMode decision has a comment sitting right next to it. This file just
 # supplies the raw values that code reads.
 
+server:
+  # Build Order Step 8's first REST endpoints (internal command interface
+  # for order-saga-orchestrator) mean this service now needs a port —
+  # order-service=8080, fraud-detection-service=8082,
+  # analytics-service=8084, schema-registry=8085 (docker), this=8086.
+  #
+  # Real, worth noting cost: Build Order Step 2's "run this same jar
+  # again in another terminal, zero config, zero port conflicts" story
+  # (see InventoryServiceApplication's Javadoc) is GONE for the REST side
+  # of this service now — two instances would collide on 8086. The Kafka
+  # consumer side still scales exactly as it always did (that's a
+  # completely separate mechanism); only the NEW synchronous entry point
+  # picked up this constraint, and only because a synchronous entry point
+  # always needs SOME single address to be reached at.
+  port: 8086
+
 spring:
   application:
     name: inventory-service

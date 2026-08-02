@@ -1,0 +1,103 @@
+# order-saga-orchestrator configuration
+
+server:
+  # order-service=8080, fraud-detection=8082, analytics=8084,
+  # schema-registry=8085 (docker), inventory-service=8086,
+  # payment-service=8087, shipment-service=8088, this=8089.
+  port: 8089
+
+spring:
+  application:
+    name: order-saga-orchestrator
+
+  # Shares order-service's Postgres DATABASE (not its tables — its own
+  # `saga` table, see schema.sql) rather than getting a dedicated one.
+  # A real "database per service" deployment would give this its own —
+  # sharing here is a deliberate infra-simplicity trade-off for this
+  # tutorial, safe only because neither service's tables reference the
+  # other's.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orderflow
+    username: orderflow
+    password: orderflow
+    driver-class-name: org.postgresql.Driver
+
+  sql:
+    init:
+      mode: always
+
+# Base URLs for the three services this orchestrator calls directly and
+# synchronously — the thing choreography never needs, because nothing in
+# that style ever calls another service's address at all.
+services:
+  inventory-service:
+    base-url: http://localhost:8086
+  payment-service:
+    base-url: http://localhost:8087
+  shipment-service:
+    base-url: http://localhost:8088
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      # Same shape for all three downstream services — a shared template
+      # would be more DRY, but naming each instance explicitly makes it
+      # obvious in application.yml (and later, in metrics/logs) which
+      # dependency's circuit is doing what, rather than one anonymous
+      # shared breaker whose state doesn't tell you WHICH call is
+      # struggling.
+      inventory-service:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 5
+        # Half or more of the last 5 calls failing trips the breaker —
+        # small window on purpose, so a demo doesn't need dozens of
+        # calls to observe OPEN state.
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 2
+        automatic-transition-from-open-to-half-open-enabled: true
+      payment-service:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 2
+        automatic-transition-from-open-to-half-open-enabled: true
+      shipment-service:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 5
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 2
+        automatic-transition-from-open-to-half-open-enabled: true
+
+  retry:
+    instances:
+      # ignore-exceptions: once @CircuitBreaker is OPEN, it throws
+      # CallNotPermittedException instead of even attempting the network
+      # call. Without listing it here, @Retry (which wraps @CircuitBreaker
+      # — see InventoryServiceClient's Javadoc for how we confirmed that
+      # ordering) would dutifully wait 300ms and try again anyway, twice,
+      # against a breaker that's already refusing calls — slow AND
+      # pointless. Listing it here makes an open-circuit call fail on its
+      # very first attempt.
+      inventory-service:
+        max-attempts: 3
+        wait-duration: 300ms
+        ignore-exceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+      payment-service:
+        max-attempts: 3
+        wait-duration: 300ms
+        ignore-exceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+      shipment-service:
+        max-attempts: 3
+        wait-duration: 300ms
+        ignore-exceptions:
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+
+logging:
+  level:
+    com.orderflow: INFO
+    io.github.resilience4j: INFO

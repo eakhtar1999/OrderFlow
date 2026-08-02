@@ -1,0 +1,28 @@
+{
+  "type": "record",
+  "name": "PaymentCompleted",
+  "namespace": "com.orderflow.avro",
+  "doc": "Published by payment-service once a charge succeeds. Carries items forward again (see InventoryReserved's doc on why) — shipment-service, the next step, needs to know WHAT to ship, not just that payment cleared.",
+
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "region", "type": "string" },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "PaidItem",
+          "fields": [
+            { "name": "productId", "type": "string" },
+            { "name": "quantity", "type": "int" }
+          ]
+        }
+      }
+    },
+    { "name": "totalAmount", "type": "double" },
+    { "name": "paidAt", "type": "long" }
+  ]
+}

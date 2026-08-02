@@ -1,0 +1,29 @@
+{
+  "type": "record",
+  "name": "PaymentFailed",
+  "namespace": "com.orderflow.avro",
+  "doc": "Published by payment-service when a charge is declined. Unlike InventoryFailed, this one DOES carry items — inventory-service's compensation listener (see PaymentFailedCompensationListener.java) consumes exactly this event to know precisely what to release back to stock. This is the choreography saga's compensating transaction, carried by the payload of a regular domain event rather than a special 'compensation command' message type.",
+
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "region", "type": "string" },
+    {
+      "name": "items",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "DeclinedItem",
+          "fields": [
+            { "name": "productId", "type": "string" },
+            { "name": "quantity", "type": "int" }
+          ]
+        }
+      }
+    },
+    { "name": "totalAmount", "type": "double" },
+    { "name": "reason", "type": "string" },
+    { "name": "failedAt", "type": "long" }
+  ]
+}

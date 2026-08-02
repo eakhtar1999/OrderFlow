@@ -1,0 +1,13 @@
+{
+  "type": "record",
+  "name": "ShipmentCreated",
+  "namespace": "com.orderflow.avro",
+  "doc": "Published by shipment-service — the final step of the choreography saga's happy path. Nothing consumes this to take further saga action (there IS no step after shipping in this tutorial's scope), so unlike every earlier event here, it does NOT carry items/totalAmount forward — order-service's OrderStatusUpdater, its only consumer, just needs to know the order shipped.",
+
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "shipmentId", "type": "string" },
+    { "name": "createdAt", "type": "long" }
+  ]
+}

@@ -1,13 +1,17 @@
 package com.orderflow.inventory.consumer;
 
+import com.orderflow.avro.InventoryFailed;
+import com.orderflow.avro.InventoryReserved;
 import com.orderflow.avro.OrderCreatedEvent;
 import com.orderflow.avro.OrderItem;
+import com.orderflow.avro.ReservedItem;
 import com.orderflow.inventory.service.StockService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.DltHandler;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.annotation.RetryableTopic;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.retrytopic.TopicSuffixingStrategy;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.kafka.support.KafkaHeaders;
@@ -15,15 +19,25 @@ import org.springframework.messaging.handler.annotation.Header;
 import org.springframework.retry.annotation.Backoff;
 import org.springframework.stereotype.Component;
 
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+
+import static com.orderflow.inventory.config.KafkaTopicConfig.INVENTORY_FAILED_TOPIC;
+import static com.orderflow.inventory.config.KafkaTopicConfig.INVENTORY_RESERVED_TOPIC;
+
 /**
  * Reacts to every order-created event. This is the "single consumer" half
  * of Build Order Step 1's "single producer/consumer, plain JSON, basic
  * flow end-to-end" — order-service publishes, this class is the first
  * thing in the platform to receive and act on it.
  *
- * For now, a "real" downstream reaction (publishing inventory-reserved,
- * letting a saga compensate on failure) doesn't exist — this listener
- * only decides and logs. That's Build Order Step 8's job.
+ * Build Order Step 8: this is also where the choreography saga actually
+ * BEGINS. Through Step 7, this method decided reserved-or-not and just
+ * logged it — the very first version of this class (Step 1) said outright
+ * "a real system would now publish an inventory-failed event and let the
+ * saga compensate... for Step 1 we just stop here." This is that "real
+ * system" moment, several build-order steps later.
  */
 @Component
 public class OrderEventListener {
@@ -41,9 +55,11 @@ public class OrderEventListener {
     private static final String POISON_PRODUCT_ID = "sku-poison";
 
     private final StockService stockService;
+    private final KafkaTemplate<Object, Object> kafkaTemplate;
 
-    public OrderEventListener(StockService stockService) {
+    public OrderEventListener(StockService stockService, KafkaTemplate<Object, Object> kafkaTemplate) {
         this.stockService = stockService;
+        this.kafkaTemplate = kafkaTemplate;
     }
 
     /**
@@ -106,9 +122,11 @@ public class OrderEventListener {
         }
 
         boolean allReserved = true;
+        List<OrderItem> reservedSoFar = new ArrayList<>();
         for (OrderItem item : event.getItems()) {
             boolean reserved = stockService.tryReserve(item.getProductId(), item.getQuantity());
             if (reserved) {
+                reservedSoFar.add(item);
                 log.info("📦 Reserved {} x {} for order {}", item.getQuantity(), item.getProductId(), event.getOrderId());
             } else {
                 log.warn("❌ Insufficient stock for {} (wanted {}) on order {}",
@@ -119,11 +137,22 @@ public class OrderEventListener {
 
         if (allReserved) {
             log.info("✅ Order {} fully reserved.", event.getOrderId());
+            publishInventoryReserved(event);
         } else {
-            // A real system would now publish an inventory-failed event
-            // and let the saga compensate anything already reserved. For
-            // Step 1 we just stop here — that's Build Order Step 8's job.
-            log.warn("⚠️  Order {} could not be fully reserved.", event.getOrderId());
+            // A LOCAL compensation, before the saga's cross-service one
+            // even enters the picture: if item 1 of 2 reserved fine but
+            // item 2 didn't, item 1's stock is genuinely decremented
+            // right now — releasing it here is what keeps "the order
+            // failed" and "stock reflects that nothing was reserved for
+            // it" consistent with each other. Skipping this would leak
+            // reserved-but-unaccounted-for stock on every partial
+            // failure.
+            for (OrderItem item : reservedSoFar) {
+                stockService.release(item.getProductId(), item.getQuantity());
+            }
+            log.warn("⚠️  Order {} could not be fully reserved — releasing the {} item(s) that DID " +
+                    "reserve, then publishing inventory-failed.", event.getOrderId(), reservedSoFar.size());
+            publishInventoryFailed(event);
         }
 
         // We only acknowledge (commit the offset) AFTER the reservation
@@ -138,6 +167,45 @@ public class OrderEventListener {
         // idempotent-consumer pattern, deduping by orderId, is what closes
         // that gap.)
         acknowledgment.acknowledge();
+    }
+
+    private void publishInventoryReserved(OrderCreatedEvent order) {
+        List<ReservedItem> items = order.getItems().stream()
+                .map(item -> ReservedItem.newBuilder()
+                        .setProductId(item.getProductId())
+                        .setQuantity(item.getQuantity())
+                        .build())
+                .toList();
+
+        InventoryReserved reserved = InventoryReserved.newBuilder()
+                .setOrderId(order.getOrderId())
+                .setCustomerId(order.getCustomerId())
+                .setRegion(order.getRegion())
+                .setItems(items)
+                .setTotalAmount(order.getTotalAmount())
+                .setReservedAt(Instant.now().toEpochMilli())
+                .build();
+
+        // Same key as order-created: customerId. Not required for
+        // correctness here (nothing downstream groups by customer the
+        // way fraud-detection-service's velocity branch did) — kept
+        // consistent anyway, on the same principle Build Order Step 6's
+        // regression taught the hard way: an event's partition key is a
+        // real design decision, not an afterthought, even when today's
+        // consumers don't happen to depend on it yet.
+        kafkaTemplate.send(INVENTORY_RESERVED_TOPIC, order.getCustomerId(), reserved);
+    }
+
+    private void publishInventoryFailed(OrderCreatedEvent order) {
+        InventoryFailed failed = InventoryFailed.newBuilder()
+                .setOrderId(order.getOrderId())
+                .setCustomerId(order.getCustomerId())
+                .setRegion(order.getRegion())
+                .setReason("Insufficient stock for one or more items")
+                .setFailedAt(Instant.now().toEpochMilli())
+                .build();
+
+        kafkaTemplate.send(INVENTORY_FAILED_TOPIC, order.getCustomerId(), failed);
     }
 
     /**
@@ -199,6 +267,21 @@ public class OrderEventListener {
  *    inventory-service instances, only ONE of them can ever be actively
  *    consuming a given retry/DLT topic at a time — no parallelism during
  *    retries, by default, even if your happy path is fully scaled out.
+ * 7. Build Order Step 8: this file is the FIRST hop of the choreography
+ *    saga — it decides, publishes a fact about that decision
+ *    (inventory-reserved / inventory-failed), and has NO idea what
+ *    happens next. payment-service reacting to inventory-reserved is a
+ *    completely separate concern this class never references — that
+ *    decoupling is the entire definition of choreography, as opposed to
+ *    orchestration (see order-saga-orchestrator), where a coordinator
+ *    explicitly knows and calls every step.
+ * 8. Partial-reservation failure needs its OWN, LOCAL compensation before
+ *    the cross-service saga compensation (PaymentFailedCompensation-
+ *    Listener) even applies: if item 1 of 2 reserves fine and item 2
+ *    doesn't, item 1 is for-real decremented in the stock map. Releasing
+ *    it before publishing inventory-failed is what keeps "this order
+ *    failed" and "stock reflects nothing was reserved for it" telling
+ *    the same story.
  *
  * 🔧 TRY IT YOURSELF
  * Place an order with productId "sku-poison" (see POISON_PRODUCT_ID) and

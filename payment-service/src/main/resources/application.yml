@@ -1,0 +1,56 @@
+# payment-service configuration
+
+server:
+  # order-service=8080, fraud-detection=8082, analytics=8084,
+  # schema-registry=8085 (docker), inventory-service=8086, this=8087.
+  port: 8087
+
+spring:
+  application:
+    name: payment-service
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+    consumer:
+      group-id: payment-service-group
+      auto-offset-reset: earliest
+      # Spring Boot's default consumer deserializer is StringDeserializer
+      # for BOTH key and value — fine for the key (customerId really is a
+      # plain string), wrong for the value, which is Avro-encoded bytes.
+      # Without this explicit override, the listener never even reaches
+      # PaymentProcessor: the container fails during payload conversion
+      # ("Cannot convert from [java.lang.String] to
+      # [com.orderflow.avro.InventoryReserved]") before your @KafkaListener
+      # method is invoked at all. inventory-service doesn't need this
+      # override because it wires its ConsumerFactory by hand in
+      # KafkaConsumerConfig.java instead of relying on these properties.
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: io.confluent.kafka.serializers.KafkaAvroDeserializer
+      properties:
+        schema.registry.url: http://localhost:8085
+        specific.avro.reader: true
+      # No custom AckMode/ConsumerFactory here, unlike inventory-service —
+      # manual offset commit was already taught there in depth (Build
+      # Order Step 1). Default auto-commit is a deliberate simplification
+      # for this module, not an oversight: repeating the same lesson a
+      # third time would teach nothing new. The at-least-once trade-offs
+      # documented on inventory-service's OrderEventListener still apply
+      # here just the same, whichever ack strategy is in play.
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      properties:
+        schema.registry.url: http://localhost:8085
+
+# The deterministic "decline" rule PaymentProcessor.java uses — a real
+# payment gateway's approval logic is opaque and probabilistic; this one
+# is neither, on purpose, so you can trigger a decline reliably just by
+# placing an order whose totalAmount crosses this number.
+payment:
+  decline-threshold-amount: 250.0
+
+logging:
+  level:
+    com.orderflow: INFO

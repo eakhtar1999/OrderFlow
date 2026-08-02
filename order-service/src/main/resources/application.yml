@@ -64,6 +64,32 @@ spring:
         acks: all
         enable.idempotence: true
 
+    # Build Order Step 8: order-service's first-ever consumer. Reacting
+    # to the saga's own events (see OrderStatusUpdater.java) to keep
+    # order-status genuinely useful — through Step 7 it only ever held
+    # one value ("CREATED") per order, so log-compaction (Build Order
+    # Step 5's whole justification for this topic) had nothing to
+    # actually compact away yet. Now an order genuinely transitions
+    # through multiple statuses, and compaction starts doing real work:
+    # only the latest one survives per key.
+    consumer:
+      group-id: order-service-status-updater
+      auto-offset-reset: earliest
+      # Without this, Spring Boot defaults to StringDeserializer for the
+      # value too, and the container fails converting every message
+      # before OrderStatusUpdater's listener methods ever run — see
+      # payment-service's application.yml for the full explanation (found
+      # live, the hard way, testing this exact saga).
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: io.confluent.kafka.serializers.KafkaAvroDeserializer
+      properties:
+        schema.registry.url: http://localhost:8085
+        specific.avro.reader: true
+      # Default (auto-commit) ack mode here too, same reasoning as
+      # payment-service and shipment-service — manual ack was already
+      # taught in depth on inventory-service's OrderEventListener; this
+      # listener doesn't need to re-teach it to justify existing.
+
 # How often OutboxRelay polls Postgres for unpublished rows. Externalized
 # (rather than hardcoded in @Scheduled) so the crash-resilience exercise
 # in the root README can override it to something much longer, giving you

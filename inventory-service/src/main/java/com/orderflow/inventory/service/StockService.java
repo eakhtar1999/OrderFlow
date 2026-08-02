@@ -55,6 +55,30 @@ public class StockService {
         stockByProductId.put(productId, currentStock - quantity);
         return true;
     }
+
+    /**
+     * Build Order Step 8: the compensating half of tryReserve — undoes a
+     * reservation that turned out not to be needed after all, because
+     * something LATER in the saga failed (payment declined; see
+     * PaymentFailedCompensationListener.java). This is the mechanical
+     * core of a choreographed saga's rollback: there's no database
+     * transaction spanning "reserve" and "release," just two independent
+     * calls, triggered by two independent events, that happen to net out
+     * to the stock level being correct again — eventually, not
+     * instantaneously.
+     *
+     * Deliberately NOT validating that `quantity` matches what was
+     * actually reserved for this exact product — this map has no concept
+     * of "reservations," only current totals, so releasing MORE than was
+     * ever reserved would silently over-credit stock. Acceptable here
+     * because the only caller passes back exactly what a prior
+     * InventoryReserved event said was reserved; a real inventory system
+     * would track reservations as their own record, not just a running
+     * total, specifically to make this operation self-validating.
+     */
+    public synchronized void release(String productId, int quantity) {
+        stockByProductId.merge(productId, quantity, Integer::sum);
+    }
 }
 
 /*
@@ -72,6 +96,14 @@ public class StockService {
  *    same last unit twice. ConcurrentHashMap.computeIfPresent makes the
  *    read-modify-write atomic WITHIN one JVM, which is necessary but not
  *    sufficient once you scale out.
+ * 3. Compensating transactions (Build Order Step 8) aren't a database
+ *    ROLLBACK — there's no transaction spanning the original reserve and
+ *    this release; they're two entirely separate operations, connected
+ *    only by both reacting to facts about the SAME order over time. The
+ *    system passes through a real intermediate state (genuinely
+ *    reserved, stock genuinely lower) before eventually correcting
+ *    itself — that window is the defining trade-off of a saga versus a
+ *    single ACID transaction.
  *
  * 🔧 TRY IT YOURSELF
  * Place two orders for "sku-7" with quantity 5 each, back to back, as fast

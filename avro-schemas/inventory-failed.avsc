@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "InventoryFailed",
+  "namespace": "com.orderflow.avro",
+  "doc": "Published by inventory-service when ANY item on an order couldn't be reserved. No items/totalAmount carried here on purpose — unlike InventoryReserved, nothing downstream ever needs to compensate a reservation that never happened. order-service's OrderStatusUpdater is this event's only consumer, and all it needs is enough to record why the order stopped here.",
+
+  "fields": [
+    { "name": "orderId", "type": "string" },
+    { "name": "customerId", "type": "string" },
+    { "name": "region", "type": "string" },
+    { "name": "reason", "type": "string" },
+    { "name": "failedAt", "type": "long" }
+  ]
+}

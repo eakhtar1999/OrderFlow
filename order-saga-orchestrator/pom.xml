@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.orderflow</groupId>
+        <artifactId>orderflow</artifactId>
+        <version>0.1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>order-saga-orchestrator</artifactId>
+    <name>order-saga-orchestrator</name>
+    <description>
+        Build Order Step 8's ORCHESTRATION-based saga — a direct
+        comparison against the choreography saga running across
+        inventory-service, payment-service, and shipment-service. Where
+        choreography has no single file describing the sequence, this
+        module IS the sequence: one class calls each step synchronously
+        over REST, tracks explicit state in Postgres, and compensates by
+        calling a prior step's undo endpoint directly, wrapped in
+        Resilience4j circuit breakers and retries since — unlike Kafka
+        — a plain synchronous HTTP call has no built-in redelivery or
+        backpressure story of its own.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Resilience4j's annotation-based (@CircuitBreaker, @Retry)
+             integration needs Spring AOP proxying to intercept method
+             calls — this starter is what wires that up. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
+        </dependency>
+
+        <!-- The all-in-one Resilience4j + Spring Boot 3 integration —
+             not in Spring Boot's own dependency-management BOM (it's a
+             third-party project), pinned via ${resilience4j.version} in
+             the parent pom like avro/confluent are. -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>order-saga-orchestrator</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>

@@ -1,0 +1,38 @@
+# shipment-service configuration
+
+server:
+  # order-service=8080, fraud-detection=8082, analytics=8084,
+  # schema-registry=8085 (docker), inventory-service=8086,
+  # payment-service=8087, this=8088.
+  port: 8088
+
+spring:
+  application:
+    name: shipment-service
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+    consumer:
+      group-id: shipment-service-group
+      auto-offset-reset: earliest
+      # Without this, Spring Boot defaults to StringDeserializer for the
+      # value too, and the container fails converting every message
+      # before PaymentCompletedListener ever runs — see payment-service's
+      # application.yml for the full explanation (found live, the hard
+      # way, testing this exact saga).
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: io.confluent.kafka.serializers.KafkaAvroDeserializer
+      properties:
+        schema.registry.url: http://localhost:8085
+        specific.avro.reader: true
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      properties:
+        schema.registry.url: http://localhost:8085
+
+logging:
+  level:
+    com.orderflow: INFO

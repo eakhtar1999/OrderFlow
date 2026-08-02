@@ -46,14 +46,15 @@
         directory that doesn't exist yet breaks the reactor build, so each
         module is added only when the tutorial reaches that step.
 
-        Build Order Steps 1-7 (current):
+        Build Order Steps 1-8 (current):
           - order-service
           - inventory-service
           - fraud-detection-service (Kafka Streams)
           - analytics-service (Kafka Streams)
+          - payment-service, shipment-service (the saga's remaining steps)
+          - order-saga-orchestrator (orchestration variant, for comparison)
 
         Coming later as the tutorial progresses:
-          - payment-service, shipment-service, order-saga-orchestrator (saga)
           - notification-service
           - search-indexer-service (Elasticsearch)
     -->
@@ -62,6 +63,9 @@
         <module>inventory-service</module>
         <module>fraud-detection-service</module>
         <module>analytics-service</module>
+        <module>payment-service</module>
+        <module>shipment-service</module>
+        <module>order-saga-orchestrator</module>
     </modules>
 
     <properties>
@@ -79,6 +83,11 @@
              pinned to the SAME Confluent release for a reason: Confluent's
              wire-format and client libraries version together. -->
         <confluent.version>7.7.0</confluent.version>
+        <!-- Build Order Step 8: order-saga-orchestrator's circuit
+             breaker + retry library. Not in Spring Boot's own BOM (it's
+             a third-party project, not a Spring one), so pinned
+             explicitly here like avro/confluent above. -->
+        <resilience4j.version>2.2.0</resilience4j.version>
     </properties>
 
     <!-- kafka-avro-serializer / kafka-schema-registry-client aren't on

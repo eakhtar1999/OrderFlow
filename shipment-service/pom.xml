@@ -10,23 +10,18 @@
         <version>0.1.0-SNAPSHOT</version>
     </parent>
 
-    <artifactId>inventory-service</artifactId>
-    <name>inventory-service</name>
+    <artifactId>shipment-service</artifactId>
+    <name>shipment-service</name>
     <description>
-        Consumes order-created events and checks/reserves stock. Through
-        Build Order Step 7 this had no REST API at all — Step 8 gives it
-        its first ever HTTP endpoints, not as a public API, but as an
-        internal command interface order-saga-orchestrator calls
-        synchronously, reusing the exact same StockService the
-        choreography saga's Kafka listeners already use.
+        Build Order Step 8's final saga step. Consumes payment-completed,
+        creates a (mock) shipment, publishes shipment-created — the
+        choreography saga's happy-path terminus. No failure mode by
+        design (see ShipmentCreator's Javadoc for why) — this is the
+        step that always succeeds, so the saga's compensation story stays
+        bounded to the payment-decline case.
     </description>
 
     <dependencies>
-        <!-- Upgraded from the plain "starter" to "-web" in Build Order
-             Step 8 — this service now has real REST endpoints
-             (internal/InternalReservationController.java), so it needs
-             the embedded Tomcat + Jackson that starter-web brings and
-             the bare starter deliberately didn't. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
@@ -37,21 +32,12 @@
             <artifactId>spring-kafka</artifactId>
         </dependency>
 
-        <!-- Build Order Step 3 retires the two Jackson dependencies that
-             used to live here (jackson-databind, jackson-datatype-jsr310)
-             — both were needed only because JsonDeserializer used Jackson
-             under the hood. KafkaAvroDeserializer (below) doesn't touch
-             Jackson at all. -->
-
         <dependency>
             <groupId>org.apache.avro</groupId>
             <artifactId>avro</artifactId>
             <version>${avro.version}</version>
         </dependency>
 
-        <!-- Same artifact as order-service's producer side — it bundles
-             both KafkaAvroSerializer and KafkaAvroDeserializer, and this
-             module only uses the latter. -->
         <dependency>
             <groupId>io.confluent</groupId>
             <artifactId>kafka-avro-serializer</artifactId>
@@ -66,18 +52,13 @@
     </dependencies>
 
     <build>
-        <finalName>inventory-service</finalName>
+        <finalName>shipment-service</finalName>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
             </plugin>
 
-            <!-- Generates THIS module's own com.orderflow.avro.OrderCreatedEvent
-                 from the SAME ../avro-schemas/order-created.avsc file
-                 order-service generates from — see that module's pom.xml
-                 for the full explanation of why each service generates
-                 its own copy instead of sharing a compiled jar. -->
             <plugin>
                 <groupId>org.apache.avro</groupId>
                 <artifactId>avro-maven-plugin</artifactId>
