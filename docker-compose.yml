@@ -164,17 +164,45 @@ services:
       retries: 10
 
   # ── Elasticsearch + Kibana (Build Order Step 10) ─────────────────────
-  # elasticsearch:
-  #   image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
-  #   container_name: orderflow-elasticsearch
-  #   ports:
-  #     - "9200:9200"
-  #
-  # kibana:
-  #   image: docker.elastic.co/kibana/kibana:8.15.0
-  #   container_name: orderflow-kibana
-  #   ports:
-  #     - "5601:5601"
+  # search-indexer-service's target: a denormalized order document per
+  # orderId, built from events across order/inventory/payment/shipment,
+  # plus a second index fed from analytics-service's windowed aggregates
+  # for Kibana to visualize. Security disabled and single-node mode are
+  # both deliberate dev-only simplifications — a real deployment runs a
+  # multi-node cluster with TLS and auth turned on, neither of which this
+  # tutorial's single-laptop docker-compose needs to demonstrate the
+  # actual indexing/search concepts.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: orderflow-elasticsearch
+    ports:
+      - "9200:9200"
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      # Default ES heap (half of container RAM, no cap) is more than a
+      # tutorial doing full-text search over a few hundred order
+      # documents needs — capped low so this doesn't compete with 7
+      # Spring Boot JVMs + Kafka + Postgres + Redis for laptop RAM.
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: orderflow-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
 
   # ── Prometheus + Grafana (Build Order Step 11) ───────────────────────
   # prometheus:
@@ -200,3 +228,4 @@ services:
 volumes:
   kafka-data:
   postgres-data:
+  elasticsearch-data:
