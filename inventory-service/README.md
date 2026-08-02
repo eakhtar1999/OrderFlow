@@ -152,6 +152,17 @@ run it multi-instance:
     already processed ... skipping` fire instead of a second reservation,
     and confirm stock is unchanged.
 
+## Testing
+
+`src/test/java/.../CoreOrderFlowIntegrationTest.java` (Build Order Step
+14) — `mvn test`. Two tests against real Testcontainers Kafka/Postgres/
+Redis: a raw `order-created` message in, `inventory-reserved` out AND
+stock genuinely decremented in Postgres; and the compensation direction
+— a raw `payment-failed` message in, stock genuinely released back to
+its starting quantity. Both check Postgres directly, not just that a
+correctly-shaped Kafka message appeared, so a listener that received the
+event but threw before calling `StockService` would still fail these.
+
 ## What's deliberately NOT here yet
 
 - The DLT handler only logs — no real alerting/incident-tracking

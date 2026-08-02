@@ -72,6 +72,15 @@ order for this module:
     `202` and one `429` — the smallest possible token bucket, useful for
     seeing the rejection trigger without needing 5+ requests.
 
+## Testing
+
+`src/test/java/.../CoreOrderFlowIntegrationTest.java` (Build Order Step
+14) — `mvn test`. Real Testcontainers Kafka/Postgres/Redis, not H2 or an
+embedded broker. Places an order over REST, then asserts BOTH the
+`order-created` and `order-status=CREATED` Kafka messages and that the
+Postgres outbox row was actually relayed (deleted) — proving the whole
+outbox pattern ran, not just that the HTTP endpoint returned 202.
+
 ## What's deliberately NOT here yet
 
 - No REST-layer idempotency key handling (flagged in `OrderController`)

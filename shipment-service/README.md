@@ -32,6 +32,15 @@ and orchestration something unambiguous to end on.
    most direct way to feel why real sagas often need MULTIPLE
    compensating steps, one per already-completed prior step, not just one.
 
+## Testing
+
+`src/test/java/.../CoreOrderFlowIntegrationTest.java` (Build Order Step
+14) — `mvn test`. Real Testcontainers Kafka (no Postgres/Redis). One
+test: a raw `payment-completed` message in, `shipment-created` out — this
+service's only behavior, by design (see `ShipmentCreator`'s Javadoc), so
+the test doesn't invent a second case just to look symmetrical with its
+siblings.
+
 ## What's deliberately NOT here yet
 
 - No actual failure mode — see `ShipmentCreator`'s Javadoc; this is the

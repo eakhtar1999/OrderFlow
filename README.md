@@ -234,7 +234,22 @@ fix, and the comments point that out explicitly as you go.
       dedicated "known gaps" section naming exactly what `claude.md` asks
       for that never got built (no automated tests anywhere being the
       biggest one). See
-      [`docs/system-design.md`](docs/system-design.md). *(you are here)*
+      [`docs/system-design.md`](docs/system-design.md).
+- [x] **14. Testcontainers integration tests for the core order flow** —
+      directly closes the biggest gap Step 13's doc named. One
+      `CoreOrderFlowIntegrationTest` per saga service (order-service,
+      inventory-service, payment-service, shipment-service), each
+      against REAL Testcontainers-managed Kafka/Postgres/Redis, chained
+      by real Kafka messages rather than one mega-test spanning multiple
+      services' Spring contexts (see `docs/system-design.md`'s note on
+      why). Covers the full choreography happy path AND the
+      payment-declined compensation path — 6 tests, all passing. Found
+      and fixed a real environment bug along the way: Testcontainers
+      1.19.8 (Spring Boot 3.3.5's managed version) hardcodes its initial
+      Docker-daemon probe to API version 1.32, which a newer Docker
+      Desktop responded to with a malformed empty-fields response —
+      fixed by overriding `testcontainers.version` to 1.21.4, whose
+      probe negotiates a modern API version instead. *(you are here)*
 
 ## Running Step 1 yourself
 
@@ -1472,6 +1487,81 @@ curl -s http://localhost:9200/orders/_doc/<orderId>
 #    live in Elasticsearch, on infrastructure that was JUST torn down
 #    and rebuilt from nothing but its named volumes.
 ```
+
+## Running Step 14 yourself (Testcontainers integration tests)
+
+```bash
+# No docker-compose infra needed — Testcontainers starts and tears down
+# its OWN Kafka/Postgres/Redis containers per test class, on random host
+# ports, independent of anything docker compose has running.
+mvn test -pl order-service,inventory-service,payment-service,shipment-service
+```
+
+Real captured output from the last run of all four modules together:
+
+```
+Running com.orderflow.order.CoreOrderFlowIntegrationTest
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 11.06 s
+Running com.orderflow.inventory.CoreOrderFlowIntegrationTest
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 11.82 s
+Running com.orderflow.payment.CoreOrderFlowIntegrationTest
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.164 s
+Running com.orderflow.shipment.CoreOrderFlowIntegrationTest
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 7.251 s
+BUILD SUCCESS
+```
+
+Each service's `CoreOrderFlowIntegrationTest` covers ITS OWN real Kafka
+contract — a raw test-harness producer stands in for the upstream
+service, a raw consumer verifies what got published downstream, and (for
+order-service/inventory-service) a `JdbcTemplate` against the real
+Testcontainers Postgres proves the actual business logic ran, not just
+that a correctly-shaped Kafka message appeared:
+
+- **order-service**: `POST /api/orders` → outbox row written → relayed
+  → `order-created` AND `order-status=CREATED` published atomically →
+  outbox row confirmed deleted.
+- **inventory-service**: `order-created` in → `inventory-reserved` out
+  → stock genuinely decremented in Postgres. A SECOND test covers the
+  compensation direction: `payment-failed` in → stock genuinely
+  released back to its starting quantity.
+- **payment-service**: BOTH branches of the deterministic decline-
+  threshold rule — an order under $250 gets `payment-completed`, an
+  order over it gets `payment-failed` carrying the same items forward.
+- **shipment-service**: `payment-completed` in → `shipment-created` out
+  — this service's only behavior, by design (see `ShipmentCreator`'s
+  Javadoc for why it has no failure path to test).
+
+### A real environment bug, found live: Testcontainers couldn't see Docker at all
+
+The very first run of `order-service`'s test failed before a single
+container even started:
+
+```
+ERROR org.testcontainers.dockerclient.DockerClientProviderStrategy -- Could not find a valid Docker environment.
+	UnixSocketClientProviderStrategy: failed with exception BadRequestException (Status 400: {"ID":"","Containers":0, ...all fields empty...})
+```
+
+`docker info` and `docker compose up` both worked fine directly — only
+Testcontainers' own internal probe failed. Isolated the exact cause by
+curling the raw Docker socket at two different API version paths:
+
+```bash
+curl --unix-socket /var/run/docker.sock http://localhost/v1.24/info   # -> same broken, empty-fields response
+curl --unix-socket /var/run/docker.sock http://localhost/v1.40/info   # -> real data, HTTP 200
+```
+
+Decompiling the actual bundled Testcontainers class confirmed the root
+cause — `DockerClientProviderStrategy.getApiVersion()` in Testcontainers
+1.19.8 (Spring Boot 3.3.5's own managed version) hardcodes its FIRST
+probe to Docker API `1.32`, a version this machine's very recent Docker
+Desktop build no longer serves correctly (it returns a malformed,
+all-empty-fields 200 instead of a proper response or error). Fixed by
+overriding the parent `pom.xml`'s `testcontainers.version` property to
+`1.21.4`, a release whose probe logic negotiates a newer API version
+instead of hardcoding 1.32 — confirmed by decompiling ITS class too and
+finding `VERSION_1_44` alongside the old constant. No code changes
+needed anywhere else; this was purely a test-dependency-version fix.
 
 ## Why Maven, why this module layout
 
