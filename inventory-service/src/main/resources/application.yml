@@ -1,0 +1,48 @@
+# inventory-service configuration
+#
+# Most of the actual consumer wiring lives in code
+# (config/KafkaConsumerConfig.java) rather than here, specifically so the
+# AckMode decision has a comment sitting right next to it. This file just
+# supplies the raw values that code reads.
+
+spring:
+  application:
+    name: inventory-service
+
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      # Every instance of inventory-service you start with THIS group-id
+      # shares the order-created topic's partitions between them — that's
+      # the mechanism Build Order Step 2 uses to demonstrate horizontal
+      # scaling and rebalancing. Change this string and you've created an
+      # entirely independent consumer, re-reading the whole topic from
+      # scratch.
+      group-id: inventory-service-group
+
+      properties:
+        # Same registry order-service's producer talks to. Both sides
+        # agreeing on this URL is what lets the consumer fetch the exact
+        # writer schema a given message was produced with, by the schema
+        # ID embedded in the message — see KafkaConsumerConfig.java.
+        schema.registry.url: http://localhost:8085
+
+      # A GOTCHA WORTH KEEPING VISIBLE: you might expect to write
+      #   client-id: inventory-instance-${random.uuid}
+      # here and read it via @Value in both KafkaConsumerConfig and
+      # InventoryServiceApplication. We tried exactly that — it compiles,
+      # it runs, and it's WRONG: ${random.uuid} is a placeholder that gets
+      # re-evaluated independently by every single @Value("${...}") call
+      # site that references this key, so two different classes each got
+      # their own, different, random UUID for what was supposed to be one
+      # instance's single identity. Caught it only by actually running two
+      # instances and comparing their logs — the startup banner and the
+      # rebalance listener showed two different ids for the same JVM.
+      # Fixed by generating the id ONCE in code (see
+      # KafkaConsumerConfig.clientId) and sharing it via a Spring bean
+      # instead of a property placeholder. No client-id key here anymore
+      # on purpose — the source of truth moved to Java.
+
+logging:
+  level:
+    com.orderflow: INFO

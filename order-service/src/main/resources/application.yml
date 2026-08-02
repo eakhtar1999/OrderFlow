@@ -1,0 +1,26 @@
+# order-service configuration
+#
+# Every Kafka behavior below is a deliberate choice, not a default left
+# untouched — read the comment above each block before changing it.
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: order-service
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+      properties:
+        schema.registry.url: http://localhost:8085
+        acks: all
+        enable.idempotence: true
+
+logging:
+  level:
+    com.orderflow: INFO
