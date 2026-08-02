@@ -125,12 +125,28 @@ public class OrderDocumentIndexer {
      * possible without any of them needing to read the current state
      * first — Elasticsearch does the merge server-side, atomically, per
      * document.
+     *
+     * {@code withRetryOnConflict(3)} — found necessary live, not assumed:
+     * without it, two listeners writing to the SAME orderId close enough
+     * together (confirmed by re-consuming this service's topics from
+     * `earliest` after a mapping fix, which fires a burst of near-
+     * simultaneous writes across all six listener threads for every
+     * historical order at once) fail with a real HTTP 409
+     * version_conflict_engine_exception — Elasticsearch's optimistic
+     * concurrency control (internal `_seq_no`/`_primary_term`) correctly
+     * detecting that the document changed between this write's read and
+     * its write. `retry_on_conflict` tells Elasticsearch to re-read and
+     * re-apply the SAME partial merge internally, server-side, up to N
+     * times, instead of surfacing the conflict as a hard failure this
+     * consumer would otherwise have to handle itself (retry-topic hop,
+     * DLT, or worse — silently dropping the update).
      */
     private void upsert(String orderId, Map<String, Object> fields) {
         Document document = Document.from(fields);
         UpdateQuery updateQuery = UpdateQuery.builder(orderId)
                 .withDocument(document)
                 .withDocAsUpsert(true)
+                .withRetryOnConflict(3)
                 .build();
         elasticsearchOperations.update(updateQuery,
                 elasticsearchOperations.getIndexCoordinatesFor(OrderDocument.class));
@@ -168,6 +184,20 @@ public class OrderDocumentIndexer {
  *    Java, PUT it back" approach would race two listeners for the same
  *    orderId arriving close together — one write would silently
  *    overwrite the other's fields.
+ * 4. `docAsUpsert` alone isn't enough under real concurrency — found
+ *    live: re-consuming this service's own topics from `earliest` (after
+ *    fixing the index-mapping bug, see ElasticsearchIndexInitializer)
+ *    fired a burst of near-simultaneous writes across all six listener
+ *    threads for the same historical orders, and some failed with a
+ *    genuine HTTP 409 version_conflict_engine_exception — Elasticsearch
+ *    correctly detecting the document changed between one listener's
+ *    read and its write. `withRetryOnConflict(3)` tells Elasticsearch to
+ *    retry the merge server-side instead of surfacing the race as a hard
+ *    failure. The exact same CLASS of problem the distributed lock
+ *    solves in inventory-service (Build Order Step 9) — concurrent
+ *    writers to shared state — solved here with server-side retry
+ *    instead of a lock, because Elasticsearch's partial-update mechanism
+ *    already has a retry knob built in for exactly this case.
  *
  * 🔧 TRY IT YOURSELF
  * Place an order, then immediately (before the saga finishes)
