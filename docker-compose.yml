@@ -110,15 +110,27 @@ services:
       retries: 10
 
   # ── Postgres (Build Order Step 5: outbox pattern; Step 9: real stock) ─
-  # postgres:
-  #   image: postgres:16
-  #   container_name: orderflow-postgres
-  #   ports:
-  #     - "5432:5432"
-  #   environment:
-  #     POSTGRES_USER: orderflow
-  #     POSTGRES_PASSWORD: orderflow
-  #     POSTGRES_DB: orderflow
+  # order-service's source of truth. The whole point of Step 5 is that
+  # order-service now writes HERE first — inside one ordinary ACID
+  # transaction alongside the outbox row — and Kafka only finds out
+  # afterward, via OutboxRelay. See order-service/README.md for why that
+  # ordering is the entire fix for the dual-write problem.
+  postgres:
+    image: postgres:16
+    container_name: orderflow-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: orderflow
+      POSTGRES_PASSWORD: orderflow
+      POSTGRES_DB: orderflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orderflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   # ── Kafka Connect + Debezium (Build Order Step 5's ALTERNATIVE to the
   # ── polling OutboxRelay we actually built — see the root README's
@@ -172,3 +184,4 @@ services:
 
 volumes:
   kafka-data:
+  postgres-data:

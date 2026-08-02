@@ -56,6 +56,23 @@
             <version>${confluent.version}</version>
         </dependency>
 
+        <!-- Build Order Step 5: order-service gets a database for the
+             first time. JdbcTemplate, not Spring Data JPA — the whole
+             point of this step is "look, here are two plain INSERTs in
+             one transaction," and an ORM's session/entity-lifecycle
+             machinery would bury that under abstraction we don't want
+             for a two-table, no-relationships schema. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

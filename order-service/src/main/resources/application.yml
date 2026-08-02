@@ -10,16 +10,68 @@ spring:
   application:
     name: order-service
 
+  # Build Order Step 5: order-service's source of truth moved to Postgres.
+  # The HTTP request path (OrderController -> OutboxWriter) touches ONLY
+  # this database — no Kafka call happens on the request thread anymore.
+  # That's the entire fix for the dual-write problem: one system, one
+  # ACID transaction, nothing to keep in sync across two different
+  # failure domains during the request itself.
+  datasource:
+    url: jdbc:postgresql://localhost:5432/orderflow
+    username: orderflow
+    password: orderflow
+    driver-class-name: org.postgresql.Driver
+
+  sql:
+    init:
+      # Run schema.sql on every startup. Safe to repeat because it's all
+      # CREATE TABLE IF NOT EXISTS — a real project outgrows this almost
+      # immediately and reaches for Flyway/Liquibase (versioned migrations,
+      # not "the whole schema every time"), deliberately skipped here to
+      # keep Step 5 focused on the outbox pattern itself, not schema
+      # tooling.
+      mode: always
+
   kafka:
     bootstrap-servers: localhost:9092
 
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: io.confluent.kafka.serializers.KafkaAvroSerializer
+
+      # This is the ONE property that turns Spring Boot's auto-configured
+      # KafkaTemplate into a TRANSACTIONAL producer — Boot detects it,
+      # registers a KafkaTransactionManager, and gives the underlying
+      # producer a transactional.id built from this prefix. OutboxRelay is
+      # the only thing in this service that sends to Kafka now (the old
+      # per-request OrderEventProducer is gone — see OutboxRelay's
+      # Javadoc), and it needs this: publishing to order-created AND
+      # order-status has to succeed or fail TOGETHER, not one-then-maybe-
+      # the-other.
+      #
+      # 🔧 Forward-looking gotcha, not yet tested: if order-service ever
+      # scales to multiple instances (like inventory-service did in Step
+      # 2), each instance's producer needs a transactional.id that's
+      # unique AND stable across restarts, or Kafka's fencing protocol
+      # will kick one out. Spring Kafka appends a per-producer suffix to
+      # this prefix automatically, which may or may not be enough on its
+      # own — flagged here, not verified, because this project runs one
+      # order-service instance through this step.
+      transaction-id-prefix: order-service-outbox-
+
       properties:
         schema.registry.url: http://localhost:8085
         acks: all
         enable.idempotence: true
+
+# How often OutboxRelay polls Postgres for unpublished rows. Externalized
+# (rather than hardcoded in @Scheduled) so the crash-resilience exercise
+# in the root README can override it to something much longer, giving you
+# a comfortable window to kill -9 the process before the relay would have
+# published on its own.
+outbox:
+  relay:
+    poll-interval-ms: 500
 
 logging:
   level:

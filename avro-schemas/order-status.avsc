@@ -1,0 +1,24 @@
+{
+  "type": "record",
+  "name": "OrderStatus",
+  "namespace": "com.orderflow.avro",
+  "doc": "Published to the LOG-COMPACTED order-status topic, keyed by orderId. Unlike order-created (a retention-based topic — an immutable log of every event that ever happened), this topic is meant to answer 'what's the CURRENT status of order X right now' by keeping only the latest record per key. Build Order Step 5 only ever writes 'CREATED' here — there's nothing to compact away yet with just one status per order. Build Order Step 8's saga work is what starts writing RESERVED / PAID / SHIPPED / FAILED here too, at which point compaction actually starts discarding the superseded ones.",
+
+  "fields": [
+    {
+      "name": "orderId",
+      "type": "string",
+      "doc": "Same value as OrderCreatedEvent.orderId — this is what makes both topics' records correlate, and what compaction keys on."
+    },
+    {
+      "name": "status",
+      "type": "string",
+      "doc": "Plain string, not an enum, on purpose: an Avro enum is a CLOSED set baked into the schema — adding 'CANCELLED' later would be a schema change with its own compatibility question. A string lets new status values appear without touching this schema at all, at the cost of typo-safety. A real system might reconsider this trade-off once the full status set is known (Build Order Step 8)."
+    },
+    {
+      "name": "updatedAt",
+      "type": "long",
+      "doc": "Epoch milliseconds — same representation choice as OrderCreatedEvent.createdAt, for the same reason (see that field's doc)."
+    }
+  ]
+}
