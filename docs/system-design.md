@@ -66,7 +66,7 @@ comparisons but also not built — see §7.6 and §8.
 | Horizontal scalability of stateless consumers | ✅ Demonstrated (inventory-service, 2 instances, live rebalance) — not load-tested under real throughput, see §8 |
 | Throughput/latency SLAs, benchmarked | ⬜ Not measured. `claude.md` §4 Performance asks for "basic load testing... throughput benchmarks across different partition counts" — never run. Single-broker, single-laptop Docker Compose isn't a meaningful environment for this anyway; flagged as future work, not attempted here |
 | Fault tolerance across broker failure (ISR/leader election) | ⬜ Not demonstrated. `replicas(1)` on every topic (see §7.9) — this project's single-broker KRaft cluster has zero replication, so there is no leader-election failover TO demonstrate without first standing up a 3-broker cluster, which is out of scope for a laptop tutorial |
-| Automated test coverage | 🟡 Build Order Step 14 added one Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service (order-service, inventory-service, payment-service, shipment-service), 6 tests, real Kafka/Postgres/Redis. Step 15 added `TopologyTestDriver`-based unit tests for both Kafka Streams apps (`fraud-detection-service`, `analytics-service`), 10 tests, no broker at all. Still ⬜: `search-indexer-service` and `order-saga-orchestrator` have no tests at all; no automated Avro contract test. See §8 |
+| Automated test coverage | 🟡 Step 14: Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service (order-service, inventory-service, payment-service, shipment-service), 6 tests, real Kafka/Postgres/Redis. Step 15: `TopologyTestDriver` unit tests for both Kafka Streams apps, 10 tests, no broker. Step 16: Testcontainers Kafka+Elasticsearch tests for search-indexer-service, 5 tests — including one that reproduces the Step 10 cross-topic-reordering bug directly as a passing assertion instead of only prose. Still ⬜: `order-saga-orchestrator` has no tests at all; no automated Avro contract test. See §8 |
 
 ## 4. High-level architecture
 
@@ -386,9 +386,14 @@ know it actually persists is to tear the container down and check.
   `analytics-service` (`.groupBy(...)` genuinely re-keying into
   independent buckets, windows genuinely resetting instead of
   accumulating) — 10 tests, no broker at all, milliseconds per test.
-  Still genuinely gaps, stated plainly: `search-indexer-service` and
-  `order-saga-orchestrator` have NO tests at all; and the manual `curl`
-  checks against Schema Registry's `/compatibility` endpoint from Step 3
+  Step 16 added real Testcontainers Kafka+Elasticsearch tests for
+  `search-indexer-service` (5 tests) — including one that doesn't just
+  add new coverage but turns an ALREADY-documented, deliberately-unfixed
+  bug (the cross-topic reordering gap from Step 10) into a real,
+  reproducible, passing assertion instead of leaving it as only prose in
+  a README. Still genuinely a gap, stated plainly: `order-saga-orchestrator`
+  has NO tests at all; and the manual `curl` checks against Schema
+  Registry's `/compatibility` endpoint from Step 3
   were never turned into an automated contract test. Most other
   "verified live" claims in this project remain exactly that — a manual
   check performed once during development, not a regression test that
