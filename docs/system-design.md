@@ -66,7 +66,7 @@ comparisons but also not built — see §7.6 and §8.
 | Horizontal scalability of stateless consumers | ✅ Demonstrated (inventory-service, 2 instances, live rebalance) — not load-tested under real throughput, see §8 |
 | Throughput/latency SLAs, benchmarked | ⬜ Not measured. `claude.md` §4 Performance asks for "basic load testing... throughput benchmarks across different partition counts" — never run. Single-broker, single-laptop Docker Compose isn't a meaningful environment for this anyway; flagged as future work, not attempted here |
 | Fault tolerance across broker failure (ISR/leader election) | ⬜ Not demonstrated. `replicas(1)` on every topic (see §7.9) — this project's single-broker KRaft cluster has zero replication, so there is no leader-election failover TO demonstrate without first standing up a 3-broker cluster, which is out of scope for a laptop tutorial |
-| Automated test coverage | 🟡 Build Order Step 14 closed the biggest piece: one Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service (order-service, inventory-service, payment-service, shipment-service), 6 tests total, covering the happy path AND the payment-declined compensation path against real Kafka/Postgres/Redis. Still ⬜: `fraud-detection-service`, `analytics-service`, `search-indexer-service`, `order-saga-orchestrator` have no tests at all; no unit tests anywhere (only integration tests); no automated Avro contract tests. See §8 |
+| Automated test coverage | 🟡 Build Order Step 14 added one Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service (order-service, inventory-service, payment-service, shipment-service), 6 tests, real Kafka/Postgres/Redis. Step 15 added `TopologyTestDriver`-based unit tests for both Kafka Streams apps (`fraud-detection-service`, `analytics-service`), 10 tests, no broker at all. Still ⬜: `search-indexer-service` and `order-saga-orchestrator` have no tests at all; no automated Avro contract test. See §8 |
 
 ## 4. High-level architecture
 
@@ -379,16 +379,20 @@ know it actually persists is to tear the container down and check.
   choreography-saga service — order-service, inventory-service,
   payment-service, shipment-service — covering the happy path and the
   payment-declined compensation path against real Kafka/Postgres/Redis
-  (6 tests, all passing). Still genuinely gaps, stated plainly:
-  `fraud-detection-service`, `analytics-service`, `search-indexer-service`,
-  and `order-saga-orchestrator` have NO tests at all; every test written
-  so far is an integration test — there isn't a single unit test
-  anywhere in this repo; and the manual `curl` checks against Schema
-  Registry's `/compatibility` endpoint from Step 3 were never turned
-  into an automated contract test. Most other "verified live" claims in
-  this project remain exactly that — a manual check performed once
-  during development, not a regression test that runs again on the next
-  change.
+  (6 tests). Step 15 added `TopologyTestDriver`-based unit tests for
+  both Kafka Streams apps — `fraud-detection-service` (both branches:
+  the leftJoin-vs-inner-join behavior, severity escalation, the exact
+  threshold-crossing point of the windowed velocity count) and
+  `analytics-service` (`.groupBy(...)` genuinely re-keying into
+  independent buckets, windows genuinely resetting instead of
+  accumulating) — 10 tests, no broker at all, milliseconds per test.
+  Still genuinely gaps, stated plainly: `search-indexer-service` and
+  `order-saga-orchestrator` have NO tests at all; and the manual `curl`
+  checks against Schema Registry's `/compatibility` endpoint from Step 3
+  were never turned into an automated contract test. Most other
+  "verified live" claims in this project remain exactly that — a manual
+  check performed once during development, not a regression test that
+  runs again on the next change.
 - **`notification-service` was never built.** Still drawn as ⬜ in the
   root README's architecture diagram. Every other consumer of the
   platform's events exists; this one doesn't, simply because nothing

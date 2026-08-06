@@ -52,6 +52,21 @@ eroding silently until something downstream actually depends on it.
    correctly resume from the restored state store rather than starting
    over at 0.
 
+## Testing
+
+`src/test/java/.../topology/FraudDetectionTopologyTest.java` (Build
+Order Step 15) — `mvn test`. A real UNIT test, a different tier from
+Step 14's Testcontainers integration tests: `TopologyTestDriver` runs
+this class's actual DSL topology in-process against no broker at all —
+milliseconds per test, not seconds waiting on Kafka. Six tests: Branch A
+(a high-value order for a customer with NO profile still gets flagged —
+the exact leftJoin-vs-inner-join behavior this file's own Javadoc calls
+out; severity escalation past 2x the threshold; a blocklisted customer
+flagged even for a tiny order; a trusted customer's small order producing
+NO alert at all) and Branch B (the exact threshold-crossing point of the
+windowed velocity count — the 3rd order in a window doesn't fire, the
+4th does; orders spread across different windows never accumulate).
+
 ## What's deliberately NOT here yet
 
 - No multi-instance interactive queries — `KafkaStreams.metadataForKey(...)`

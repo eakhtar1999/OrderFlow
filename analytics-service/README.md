@@ -38,6 +38,20 @@ along dimensions `order-created` was never partitioned by.
    `(sum, count)` pair as the accumulator instead of a plain `Double`) as
    a genuine extension exercise.
 
+## Testing
+
+`src/test/java/.../topology/AnalyticsTopologyTest.java` (Build Order
+Step 15) — `mvn test`. A real UNIT test via `TopologyTestDriver` — see
+fraud-detection-service's sibling test/README for the full explanation
+of why this is a different tier from Step 14's Testcontainers tests.
+Four tests: the global count correctly accumulates across multiple
+orders in one window, then correctly RESETS for a new window instead of
+running as one ever-growing total; the per-region revenue sum correctly
+folds multiple orders' `totalAmount` together; and two regions in the
+same window are proven to be tracked as completely independent sums,
+not one shared bucket — direct evidence `.groupBy(...)`'s re-key
+actually works, not just that SOME output appeared.
+
 ## What's deliberately NOT here yet
 
 - **`fraud-flag rate`** — `claude.md`'s suggested third analytics metric
