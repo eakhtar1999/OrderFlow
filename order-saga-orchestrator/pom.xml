@@ -65,6 +65,57 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- Build Order Step 17 — see order-service/pom.xml's Step 14
+             comment for why real containers, not embedded stand-ins.
+             This module has no Kafka/Avro at all (see this file's own
+             description above) — Postgres for the real saga table is
+             the only Testcontainers module it needs. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- WireMock stands in for inventory-service/payment-service/
+             shipment-service's REST endpoints — ONE server, since each
+             client hits a different path (/internal/reserve,
+             /internal/charge, /internal/ship), so no path collisions
+             exist between the three. Not in Spring Boot's own BOM
+             (third-party), pinned explicitly like resilience4j.version
+             above. This is what makes the Retry/CircuitBreaker tests
+             possible at all — scripting a downstream failure, then a
+             recovery, on demand, is not something a real service (or
+             Testcontainers) can do on command the way a stub server can.
+
+             The "-standalone" classifier, not plain "wiremock", found
+             necessary live: plain wiremock's own transitive
+             httpclient5 version lost Maven's dependency-mediation to
+             Spring Boot's older managed one, and the resulting mismatch
+             threw a real NoSuchMethodError
+             (RequestConfig$Builder.setProtocolUpgradeEnabled) the
+             instant WireMockExtension tried to start its server.
+             wiremock-standalone shades ALL of its third-party
+             dependencies (Jetty, httpclient5, Jackson, Guava) under
+             relocated package names specifically so embedding it in a
+             host application with its OWN versions of those same
+             libraries — which every Spring Boot app has — can't
+             collide this way. WireMock's OWN public API classes
+             (com.github.tomakehurst.wiremock.*, used throughout this
+             module's tests) are NOT shaded, so no code changes were
+             needed beyond this one pom.xml line. -->
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock-standalone</artifactId>
+            <version>3.13.2</version>
+            <scope>test</scope>
+        </dependency>
+
         <!-- Build Order Step 11 — see order-service/pom.xml's comment.
              Also gives Resilience4j's own circuit-breaker/retry state
              (call counts, failure rates, state transitions) a Micrometer

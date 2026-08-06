@@ -278,7 +278,28 @@ fix, and the comments point that out explicitly as you go.
       confirming the exact status regression (`SHIPPED` back to
       `CREATED`) the module's README already described in prose. The bug
       stays unfixed on purpose — the test exists so it can't silently get
-      worse unnoticed. *(you are here)*
+      worse unnoticed.
+- [x] **17. order-saga-orchestrator tests** — closes the last named gap
+      from Step 13's doc. Real Testcontainers Postgres for the actual
+      `saga` table, plus ONE WireMock server standing in for all three
+      downstream services (no path collisions between
+      `/internal/reserve`, `/internal/charge`, `/internal/ship`,
+      `/internal/release`). Five tests: the happy path; payment declined
+      genuinely triggering `/internal/release` with the right orderId
+      (verified against WireMock's own request log); inventory declined
+      failing immediately with zero compensation or payment attempts; a
+      WireMock Scenario proving `@Retry` actually retries (fail, fail,
+      succeed on the 3rd attempt); and a test asserting against the real
+      `CircuitBreakerRegistry` bean's state (`CLOSED` → `OPEN`) after
+      sustained failures, then confirming a further call makes NO
+      additional HTTP request at all. Found and fixed a real WireMock/JDK
+      HttpClient interop bug along the way: WireMock's Jetty-based server
+      answered the JDK HttpClient's default h2c cleartext-upgrade attempt
+      with a raw `RST_STREAM`, failing every stubbed call at the
+      transport level — fixed with `http2PlainDisabled(true)`, a
+      WireMock-specific quirk unrelated to the real services this test
+      stands in for (Tomcat doesn't negotiate h2c by default either).
+      *(you are here)*
 
 ## Running Step 1 yourself
 
@@ -1671,6 +1692,60 @@ gets created from whichever event arrives first (by design — see
 the document backward from `SHIPPED`. Nothing about this test is a new
 discovery — it exists so a future change to `OrderDocumentIndexer`
 can't silently make an already-known gap worse without a test noticing.
+
+## Running Step 17 yourself (order-saga-orchestrator tests)
+
+```bash
+mvn test -pl order-saga-orchestrator
+```
+
+Real captured output:
+
+```
+Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 6.7 s
+BUILD SUCCESS
+```
+
+### A real environment bug, found live: WireMock's Jetty vs. the JDK's HttpClient
+
+The very first run failed all five tests identically, before a single
+stub even had a chance to matter:
+
+```
+java.lang.NoSuchMethodError: 'org.apache.hc.client5.http.config.RequestConfig$Builder
+  org.apache.hc.client5.http.config.RequestConfig$Builder.setProtocolUpgradeEnabled(boolean)'
+	at com.github.tomakehurst.wiremock.http.HttpClientFactory.createClient(...)
+```
+
+Plain `org.wiremock:wiremock`'s own transitive `httpclient5` lost Maven's
+dependency-mediation to Spring Boot's older managed version. Fixed by
+switching to the `wiremock-standalone` artifact, which shades all of its
+third-party dependencies (Jetty, httpclient5, Jackson, Guava) under
+relocated package names specifically to avoid this exact class of
+conflict when embedded in a host application — WireMock's own public API
+classes stay at their normal package names, so no test code changed.
+
+That fix uncovered a SECOND, different failure — every stubbed call now
+failing with a raw transport error instead of hitting a stub at all:
+
+```
+org.springframework.web.client.ResourceAccessException: I/O error on POST
+  request for "http://localhost:.../internal/reserve": Received RST_STREAM: Stream cancelled
+```
+
+Spring's `RestClient` falls back to the JDK's own `java.net.http.HttpClient`
+here (WireMock's shaded httpclient5/Jetty aren't visible on the classpath
+for Spring Boot's usual auto-detection to find one of its preferred
+clients), and that client's default cleartext HTTP/2-upgrade (h2c)
+attempt against WireMock's Jetty-based server got answered with a real
+stream reset — every single call failing at the transport level, before
+WireMock ever got a chance to apply a stub. Fixed with
+`http2PlainDisabled(true)` on WireMock's configuration, forcing plain
+HTTP/1.1 responses. Real inventory-service/payment-service/shipment-service
+run on Tomcat, which doesn't negotiate h2c by default either — this was a
+WireMock/Jetty-specific interop quirk this test setup needed to work
+around, not evidence of a latent bug in the actual services these tests
+stand in for.
 
 ## Why Maven, why this module layout
 
