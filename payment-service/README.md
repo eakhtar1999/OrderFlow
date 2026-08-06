@@ -41,6 +41,17 @@ actual "approve or decline" decision is made.
    yourself, including the real retry timing and the CLOSED → OPEN →
    HALF_OPEN → CLOSED lifecycle.
 
+## Testing
+
+`src/test/java/.../CoreOrderFlowIntegrationTest.java` (Build Order Step
+14) — `mvn test`. Real Testcontainers Kafka (no Postgres/Redis — this
+service is stateless). Two tests, one per branch of the decline-threshold
+rule: an `inventory-reserved` message under $250 gets `payment-completed`;
+one over $250 gets `payment-failed` carrying the same items forward. Both
+subscribe to BOTH output topics and assert on whichever one is expected,
+so an inverted threshold would time out waiting on the wrong topic
+instead of silently passing.
+
 ## What's deliberately NOT here yet
 
 - No real payment gateway integration — `PaymentProcessor`'s deterministic

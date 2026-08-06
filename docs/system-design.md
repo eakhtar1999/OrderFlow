@@ -66,7 +66,7 @@ comparisons but also not built — see §7.6 and §8.
 | Horizontal scalability of stateless consumers | ✅ Demonstrated (inventory-service, 2 instances, live rebalance) — not load-tested under real throughput, see §8 |
 | Throughput/latency SLAs, benchmarked | ⬜ Not measured. `claude.md` §4 Performance asks for "basic load testing... throughput benchmarks across different partition counts" — never run. Single-broker, single-laptop Docker Compose isn't a meaningful environment for this anyway; flagged as future work, not attempted here |
 | Fault tolerance across broker failure (ISR/leader election) | ⬜ Not demonstrated. `replicas(1)` on every topic (see §7.9) — this project's single-broker KRaft cluster has zero replication, so there is no leader-election failover TO demonstrate without first standing up a 3-broker cluster, which is out of scope for a laptop tutorial |
-| Automated test coverage | ⬜ **None.** No `src/test/java` exists anywhere in this repo. `claude.md`'s deliverable #10 explicitly asks for Testcontainers/Embedded Kafka integration tests — this is the single largest gap between the requirements doc and what's actually built. See §8 |
+| Automated test coverage | 🟡 Build Order Step 14 closed the biggest piece: one Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service (order-service, inventory-service, payment-service, shipment-service), 6 tests total, covering the happy path AND the payment-declined compensation path against real Kafka/Postgres/Redis. Still ⬜: `fraud-detection-service`, `analytics-service`, `search-indexer-service`, `order-saga-orchestrator` have no tests at all; no unit tests anywhere (only integration tests); no automated Avro contract tests. See §8 |
 
 ## 4. High-level architecture
 
@@ -180,7 +180,7 @@ request thread in Build Order Step 5 (§7.5).
 | Partition count / replication factor experiments | 🟡 | Every topic uses `partitions(3)`; `.replicas(1)` is the ONLY option on this project's single-broker cluster. No throughput comparison across different partition counts was run (see §3) |
 | Kafka UI / AKHQ | ✅ | `docker-compose.yml`, `orderflow-kafka-ui` |
 | Micrometer → Prometheus, incl. consumer lag | ✅ | Build Order Step 11, including a real gap found and fixed live (inventory-service's hand-built `ConsumerFactory` silently missing the lag binding) |
-| Embedded Kafka / Testcontainers integration tests | ⬜ | **Not built anywhere in this repo.** See §3 and §8 |
+| Embedded Kafka / Testcontainers integration tests | ✅ | Build Order Step 14 — real Testcontainers-managed Kafka/Postgres/Redis (deliberately NOT Spring Kafka's embedded broker; see `CoreOrderFlowIntegrationTest`'s Javadoc for why that distinction mattered for reproducing Step 12's class of bug), one test class per saga service. See §8 for what's still untested |
 | Contract tests for Avro compatibility | ⬜ | Compatibility was verified manually, live, via `curl` against Schema Registry's `/compatibility` endpoint (Step 3) — not automated as a repeatable test |
 
 ## 7. Trade-offs considered
@@ -374,15 +374,21 @@ know it actually persists is to tear the container down and check.
 
 ## 8. Known gaps (deliberately not built, stated plainly)
 
-- **No automated tests anywhere in this repo** — the single biggest gap
-  versus `claude.md`. Every "verified live" claim in this project (and
-  there are many) was a manual `curl`/`docker exec` check performed once
+- **Automated test coverage is now partial, not absent.** Build Order
+  Step 14 added a Testcontainers `CoreOrderFlowIntegrationTest` per
+  choreography-saga service — order-service, inventory-service,
+  payment-service, shipment-service — covering the happy path and the
+  payment-declined compensation path against real Kafka/Postgres/Redis
+  (6 tests, all passing). Still genuinely gaps, stated plainly:
+  `fraud-detection-service`, `analytics-service`, `search-indexer-service`,
+  and `order-saga-orchestrator` have NO tests at all; every test written
+  so far is an integration test — there isn't a single unit test
+  anywhere in this repo; and the manual `curl` checks against Schema
+  Registry's `/compatibility` endpoint from Step 3 were never turned
+  into an automated contract test. Most other "verified live" claims in
+  this project remain exactly that — a manual check performed once
   during development, not a regression test that runs again on the next
-  change. A real next step: Testcontainers-based integration tests for
-  the core choreography saga (place an order, assert it reaches
-  `SHIPPED`), plus a schema-compatibility contract test replacing the
-  manual `curl` checks against Schema Registry's `/compatibility`
-  endpoint done in Step 3.
+  change.
 - **`notification-service` was never built.** Still drawn as ⬜ in the
   root README's architecture diagram. Every other consumer of the
   platform's events exists; this one doesn't, simply because nothing
