@@ -249,7 +249,22 @@ fix, and the comments point that out explicitly as you go.
       Docker-daemon probe to API version 1.32, which a newer Docker
       Desktop responded to with a malformed empty-fields response —
       fixed by overriding `testcontainers.version` to 1.21.4, whose
-      probe negotiates a modern API version instead. *(you are here)*
+      probe negotiates a modern API version instead.
+- [x] **15. Kafka Streams unit tests** — `fraud-detection-service` and
+      `analytics-service` both already depended on
+      `kafka-streams-test-utils` (declared since the reactor's original
+      build, never used) — `TopologyTestDriver` runs each topology's
+      actual DSL in-process, no broker at all, a genuinely different
+      testing tier from Step 14: milliseconds per test instead of
+      seconds waiting on Kafka. 10 tests total. fraud-detection-service's
+      6 cover both branches — the leftJoin-vs-inner-join behavior the
+      topology's own Javadoc calls out (an order for a customer with NO
+      profile still gets evaluated), severity escalation, and the exact
+      threshold-crossing point of the windowed velocity count (3rd order
+      doesn't fire, 4th does). analytics-service's 4 prove `.groupBy(...)`
+      genuinely re-keys (a global count blind to region, a per-region sum
+      that's NOT one shared bucket) and that windows genuinely reset
+      instead of accumulating forever. *(you are here)*
 
 ## Running Step 1 yourself
 
@@ -1562,6 +1577,50 @@ overriding the parent `pom.xml`'s `testcontainers.version` property to
 instead of hardcoding 1.32 — confirmed by decompiling ITS class too and
 finding `VERSION_1_44` alongside the old constant. No code changes
 needed anywhere else; this was purely a test-dependency-version fix.
+
+## Running Step 15 yourself (Kafka Streams unit tests)
+
+```bash
+# No Docker at all — TopologyTestDriver runs entirely in-process.
+mvn test -pl fraud-detection-service,analytics-service
+```
+
+Real captured output from the last run:
+
+```
+Running com.orderflow.fraud.topology.FraudDetectionTopologyTest
+Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.502 s
+Running com.orderflow.analytics.topology.AnalyticsTopologyTest
+Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.458 s
+BUILD SUCCESS
+```
+
+Both `kafka-streams-test-utils` dependencies had been sitting in these
+two modules' `pom.xml` files, unused, since the reactor's original
+build — Kafka Streams apps are idiomatically tested this way (a real
+`Topology` run by `TopologyTestDriver`, no broker), and both modules'
+authors had already anticipated it without anyone writing the tests
+themselves until now.
+
+Each topology class (`FraudDetectionTopology`, `AnalyticsTopology`) is
+instantiated directly in its test — NOT through Spring — with its
+`@Value`-injected fields (thresholds, window sizes, the schema registry
+URL) set via `ReflectionTestUtils.setField(...)` to the exact same
+values `application.yml` supplies in production. `buildTopology(StreamsBuilder)`
+is a plain method with no real dependency on Spring's DI container at
+all; production only uses Spring to construct the object and call it —
+the test proves the topology's DECISION LOGIC doesn't need Spring
+there.
+
+A real, worth-noting design point both test files share: window-boundary
+tests use a FIXED, epoch-relative base `Instant` (e.g.
+`Instant.EPOCH.plusSeconds(60)`), never `Instant.now()`. `TimeWindows`
+are tumbling windows aligned to absolute epoch boundaries, not relative
+to whenever a test happens to run — a window-boundary test built on
+wall-clock "now" would pass the overwhelming majority of the time and
+fail, rarely and seemingly at random, exactly when a test run happened
+to start within a few seconds of a real window boundary. Anchoring to a
+known offset from epoch makes every run identical, every time.
 
 ## Why Maven, why this module layout
 
