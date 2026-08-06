@@ -27,6 +27,24 @@ windowed aggregates into their own indices for Kibana.
 4. Open Kibana (`localhost:5601`) and browse the `orders`, `orders-per-minute`, and `revenue-by-region` data views (already created via Kibana's Data Views API, not manually through the UI) — build a simple line chart of `orderCount` over `windowStart` to visualize analytics-service's own windowed aggregation, this time as a chart instead of a JSON response.
 5. Stop this service, place a few orders, wait, then restart it — confirm it picks up exactly where its consumer group left off (no re-indexing of orders it already processed), the same at-least-once/offset-commit story every other consumer in this platform has followed since Build Order Step 1.
 
+## Testing
+
+`src/test/java/.../CoreOrderFlowIntegrationTest.java` (Build Order Step
+16) — `mvn test`. Real Testcontainers Kafka AND Elasticsearch (the same
+`xpack.security.enabled=false` single-node image docker-compose.yml
+runs). Five tests: the full happy-path saga building one document
+incrementally across four partial updates, with the FIRST event's fields
+confirmed to survive three later, unrelated merges; the inventory-failed
+path setting `status`/`reason`; the faceted search endpoint filtering by
+region and status; `AnalyticsMetricsIndexer`'s simpler full-document save
+behavior; and — the standout one — a test that doesn't hide this
+module's own documented "cross-topic reordering" limitation but
+reproduces it directly: publishing `shipment-created` before
+`order-created` for the same orderId, and asserting the exact status
+regression (`SHIPPED` back to `CREATED`) the README below already
+describes in prose. The bug stays unfixed on purpose; the test exists so
+it can't silently get WORSE unnoticed.
+
 ## What's deliberately NOT here yet
 
 - **Cross-topic reordering during a cold backfill/replay is a real, found gap, not just a theoretical one.** In normal live operation, `order-created` always arrives before any downstream saga event for the same order (nothing downstream can fire before the order exists) — but Kafka only guarantees ordering WITHIN a topic-partition, never ACROSS different topics. Resetting this service's consumer group to `earliest` (done live, to verify the mapping fix) fired all six listeners' backlogs concurrently, and for at least one historical order, `order-created`'s upsert (which unconditionally writes `status: CREATED`) was processed AFTER that order's `shipment-created` event, silently regressing its indexed status backward from `SHIPPED` to `CREATED` — permanently, since no further real events exist to correct it. The professional fix is a scripted (Painless) conditional update comparing each write's own timestamp against the document's currently stored `updatedAt` and no-op'ing if the incoming write is older — deliberately not built here, flagged instead, since it's a genuine step up in complexity for what is specifically a cold-replay edge case, not a live-traffic bug.

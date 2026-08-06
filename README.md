@@ -264,7 +264,21 @@ fix, and the comments point that out explicitly as you go.
       doesn't fire, 4th does). analytics-service's 4 prove `.groupBy(...)`
       genuinely re-keys (a global count blind to region, a per-region sum
       that's NOT one shared bucket) and that windows genuinely reset
-      instead of accumulating forever. *(you are here)*
+      instead of accumulating forever.
+- [x] **16. search-indexer-service tests** — real Testcontainers Kafka
+      AND Elasticsearch, closing another of Step 13's named gaps. Five
+      tests: the full happy-path saga building one Elasticsearch document
+      incrementally across four partial updates (with the FIRST event's
+      fields confirmed to survive three later, unrelated merges); the
+      inventory-failed path; the faceted search endpoint; the second
+      indexer's full-document save behavior — and one that doesn't hide
+      this module's own documented "cross-topic reordering" limitation
+      but reproduces it directly as a real, passing assertion: publishing
+      `shipment-created` before `order-created` for the same order and
+      confirming the exact status regression (`SHIPPED` back to
+      `CREATED`) the module's README already described in prose. The bug
+      stays unfixed on purpose — the test exists so it can't silently get
+      worse unnoticed. *(you are here)*
 
 ## Running Step 1 yourself
 
@@ -1621,6 +1635,42 @@ wall-clock "now" would pass the overwhelming majority of the time and
 fail, rarely and seemingly at random, exactly when a test run happened
 to start within a few seconds of a real window boundary. Anchoring to a
 known offset from epoch makes every run identical, every time.
+
+## Running Step 16 yourself (search-indexer-service tests)
+
+```bash
+mvn test -pl search-indexer-service
+```
+
+Real captured output:
+
+```
+Running com.orderflow.search.CoreOrderFlowIntegrationTest
+Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 42.47 s
+BUILD SUCCESS
+```
+
+Slower than Step 14's saga-service tests (Elasticsearch's own startup
+inside the container, plus six independent `@KafkaListener` consumer
+groups all rebalancing at once) but still fully self-contained — no
+`docker compose up` needed, Testcontainers manages both containers
+per test class.
+
+The standout test here doesn't just cover new code — it turns an
+already-known, already-documented, deliberately-unfixed bug into a real,
+reproducible assertion. `search-indexer-service/README.md`'s own "What's
+deliberately NOT here yet" section has described the cross-topic
+reordering gap in prose since Build Order Step 10: Kafka only guarantees
+ordering WITHIN a topic-partition, never ACROSS different topics, so a
+cold consumer-group replay could in principle deliver `shipment-created`
+before `order-created` for the same order. The test simulates exactly
+that ordering and confirms the actual, current behavior: the document
+gets created from whichever event arrives first (by design — see
+`OrderDocumentIndexer`'s own Javadoc), and when `order-created` arrives
+"late," its unconditional `status: CREATED` write genuinely regresses
+the document backward from `SHIPPED`. Nothing about this test is a new
+discovery — it exists so a future change to `OrderDocumentIndexer`
+can't silently make an already-known gap worse without a test noticing.
 
 ## Why Maven, why this module layout
 
