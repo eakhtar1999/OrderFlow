@@ -66,7 +66,7 @@ comparisons but also not built — see §7.6 and §8.
 | Horizontal scalability of stateless consumers | ✅ Demonstrated (inventory-service, 2 instances, live rebalance) — not load-tested under real throughput, see §8 |
 | Throughput/latency SLAs, benchmarked | ⬜ Not measured. `claude.md` §4 Performance asks for "basic load testing... throughput benchmarks across different partition counts" — never run. Single-broker, single-laptop Docker Compose isn't a meaningful environment for this anyway; flagged as future work, not attempted here |
 | Fault tolerance across broker failure (ISR/leader election) | ⬜ Not demonstrated. `replicas(1)` on every topic (see §7.9) — this project's single-broker KRaft cluster has zero replication, so there is no leader-election failover TO demonstrate without first standing up a 3-broker cluster, which is out of scope for a laptop tutorial |
-| Automated test coverage | 🟡 Step 14: Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service (order-service, inventory-service, payment-service, shipment-service), 6 tests, real Kafka/Postgres/Redis. Step 15: `TopologyTestDriver` unit tests for both Kafka Streams apps, 10 tests, no broker. Step 16: Testcontainers Kafka+Elasticsearch tests for search-indexer-service, 5 tests — including one that reproduces the Step 10 cross-topic-reordering bug directly as a passing assertion instead of only prose. Still ⬜: `order-saga-orchestrator` has no tests at all; no automated Avro contract test. See §8 |
+| Automated test coverage | 🟡 Step 14: Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service, 6 tests, real Kafka/Postgres/Redis. Step 15: `TopologyTestDriver` unit tests for both Kafka Streams apps, 10 tests, no broker. Step 16: Testcontainers Kafka+Elasticsearch tests for search-indexer-service, 5 tests — including one reproducing the Step 10 cross-topic-reordering bug as a passing assertion. Step 17: Testcontainers Postgres + WireMock tests for order-saga-orchestrator, 5 tests, covering the happy path, real compensation verified against WireMock's own request log, `@Retry` actually retrying, and `@CircuitBreaker` actually tripping (asserted against the real `CircuitBreakerRegistry` bean). Every module in this reactor now has tests except the ones with no independent logic of their own to test (see §8). Still ⬜: no automated Avro contract test. See §8 |
 
 ## 4. High-level architecture
 
@@ -391,11 +391,22 @@ know it actually persists is to tear the container down and check.
   add new coverage but turns an ALREADY-documented, deliberately-unfixed
   bug (the cross-topic reordering gap from Step 10) into a real,
   reproducible, passing assertion instead of leaving it as only prose in
-  a README. Still genuinely a gap, stated plainly: `order-saga-orchestrator`
-  has NO tests at all; and the manual `curl` checks against Schema
-  Registry's `/compatibility` endpoint from Step 3
-  were never turned into an automated contract test. Most other
-  "verified live" claims in this project remain exactly that — a manual
+  a README. Step 17 added Testcontainers Postgres + WireMock tests for
+  `order-saga-orchestrator` (5 tests) — the happy path; payment declined
+  genuinely triggering the compensating `/internal/release` call,
+  verified against WireMock's own request log rather than inferred from
+  the saga's final status; a WireMock Scenario proving `@Retry` actually
+  retries (fail, fail, succeed on the 3rd attempt); and a test asserting
+  against the real `CircuitBreakerRegistry` bean's state transition
+  (`CLOSED` → `OPEN`) after sustained failures, confirming a further call
+  makes zero additional HTTP requests. Every module in this reactor now
+  has real tests except ones with no independent decision logic of their
+  own worth testing this way (`avro-schemas` isn't code;
+  `notification-service` was never built at all — see below). The one
+  remaining genuine gap, stated plainly: the manual `curl` checks against
+  Schema Registry's `/compatibility` endpoint from Step 3 were never
+  turned into an automated contract test. Most other "verified live"
+  claims in this project remain exactly that — a manual
   check performed once during development, not a regression test that
   runs again on the next change.
 - **`notification-service` was never built.** Still drawn as ⬜ in the

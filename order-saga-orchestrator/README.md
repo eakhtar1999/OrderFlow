@@ -57,6 +57,26 @@ triggered by structurally different requests.
    versus what the equivalent choreography change would need (a new
    listener + producer pair, nothing else).
 
+## Testing
+
+`src/test/java/.../SagaOrchestratorIntegrationTest.java` (Build Order
+Step 17) — `mvn test`. Real Testcontainers Postgres for the actual
+`saga` table, plus ONE WireMock server standing in for
+inventory-service/payment-service/shipment-service (no path collisions
+between `/internal/reserve`, `/internal/charge`, `/internal/ship`, and
+`/internal/release`, so one stub server covers all three real
+services). Five tests: the happy path reaching `SHIPPED`; payment
+declined compensating by genuinely calling `/internal/release` with the
+right orderId (verified against WireMock's own request log, not
+inferred from the saga's status); inventory declined failing immediately
+with no compensation or payment attempt; a WireMock Scenario proving
+`@Retry` actually retries (fail, fail, succeed on the 3rd attempt,
+exactly matching `application.yml`'s `max-attempts: 3`); and a test that
+asserts against the real `CircuitBreakerRegistry` bean's state
+(`CLOSED` → `OPEN`) after sustained failures, then confirms a
+subsequent call makes NO further HTTP request at all — the actual proof
+`ignore-exceptions` is working, not just configured.
+
 ## What's deliberately NOT here yet
 
 - No idempotency on `POST /api/saga/orders` — calling it twice with
