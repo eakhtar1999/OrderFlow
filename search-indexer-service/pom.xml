@@ -58,6 +58,28 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- Build Order Step 16 — see order-service/pom.xml's Step 14
+             comment for why real containers, not embedded stand-ins.
+             The elasticsearch module here is new to this reactor (no
+             other module talks to Elasticsearch) — kafka/junit-jupiter
+             match every other saga service's test dependencies. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>elasticsearch</artifactId>
+            <scope>test</scope>
+        </dependency>
+
         <!-- Build Order Step 11 — see order-service/pom.xml's comment. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
