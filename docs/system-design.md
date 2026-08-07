@@ -66,7 +66,7 @@ comparisons but also not built — see §7.6 and §8.
 | Horizontal scalability of stateless consumers | ✅ Demonstrated (inventory-service, 2 instances, live rebalance) — not load-tested under real throughput, see §8 |
 | Throughput/latency SLAs, benchmarked | ⬜ Not measured. `claude.md` §4 Performance asks for "basic load testing... throughput benchmarks across different partition counts" — never run. Single-broker, single-laptop Docker Compose isn't a meaningful environment for this anyway; flagged as future work, not attempted here |
 | Fault tolerance across broker failure (ISR/leader election) | ⬜ Not demonstrated. `replicas(1)` on every topic (see §7.9) — this project's single-broker KRaft cluster has zero replication, so there is no leader-election failover TO demonstrate without first standing up a 3-broker cluster, which is out of scope for a laptop tutorial |
-| Automated test coverage | 🟡 Step 14: Testcontainers `CoreOrderFlowIntegrationTest` per choreography-saga service, 6 tests, real Kafka/Postgres/Redis. Step 15: `TopologyTestDriver` unit tests for both Kafka Streams apps, 10 tests, no broker. Step 16: Testcontainers Kafka+Elasticsearch tests for search-indexer-service, 5 tests — including one reproducing the Step 10 cross-topic-reordering bug as a passing assertion. Step 17: Testcontainers Postgres + WireMock tests for order-saga-orchestrator, 5 tests, covering the happy path, real compensation verified against WireMock's own request log, `@Retry` actually retrying, and `@CircuitBreaker` actually tripping (asserted against the real `CircuitBreakerRegistry` bean). Every module in this reactor now has tests except the ones with no independent logic of their own to test (see §8). Still ⬜: no automated Avro contract test. See §8 |
+| Automated test coverage | ✅ Steps 14-17 gave every module with independent decision logic real tests (Testcontainers integration tests for the 4 choreography-saga services + search-indexer-service, `TopologyTestDriver` unit tests for both Kafka Streams apps, Testcontainers+WireMock tests for order-saga-orchestrator). Step 18 closed the last named gap: a real, automated Avro schema-compatibility contract test (below), replacing the manual `curl` checks from Step 3. See §8 for the still-honest caveat (most "verified live" claims elsewhere in this project remain manual, one-time checks, not regression tests) |
 
 ## 4. High-level architecture
 
@@ -181,7 +181,7 @@ request thread in Build Order Step 5 (§7.5).
 | Kafka UI / AKHQ | ✅ | `docker-compose.yml`, `orderflow-kafka-ui` |
 | Micrometer → Prometheus, incl. consumer lag | ✅ | Build Order Step 11, including a real gap found and fixed live (inventory-service's hand-built `ConsumerFactory` silently missing the lag binding) |
 | Embedded Kafka / Testcontainers integration tests | ✅ | Build Order Step 14 — real Testcontainers-managed Kafka/Postgres/Redis (deliberately NOT Spring Kafka's embedded broker; see `CoreOrderFlowIntegrationTest`'s Javadoc for why that distinction mattered for reproducing Step 12's class of bug), one test class per saga service. See §8 for what's still untested |
-| Contract tests for Avro compatibility | ⬜ | Compatibility was verified manually, live, via `curl` against Schema Registry's `/compatibility` endpoint (Step 3) — not automated as a repeatable test |
+| Contract tests for Avro compatibility | ✅ | Build Order Step 18 — `SchemaCompatibilityContractTest` (order-service), real Testcontainers Kafka + Schema Registry, reading the actual `avro-schemas/order-created.avsc` off disk. Replaces the manual `curl` checks from Step 3 with three automated tests matching those exact, real, live-verified results |
 
 ## 7. Trade-offs considered
 
@@ -399,16 +399,26 @@ know it actually persists is to tear the container down and check.
   retries (fail, fail, succeed on the 3rd attempt); and a test asserting
   against the real `CircuitBreakerRegistry` bean's state transition
   (`CLOSED` → `OPEN`) after sustained failures, confirming a further call
-  makes zero additional HTTP requests. Every module in this reactor now
-  has real tests except ones with no independent decision logic of their
-  own worth testing this way (`avro-schemas` isn't code;
-  `notification-service` was never built at all — see below). The one
-  remaining genuine gap, stated plainly: the manual `curl` checks against
-  Schema Registry's `/compatibility` endpoint from Step 3 were never
-  turned into an automated contract test. Most other "verified live"
-  claims in this project remain exactly that — a manual
-  check performed once during development, not a regression test that
-  runs again on the next change.
+  makes zero additional HTTP requests. Step 18 added
+  `SchemaCompatibilityContractTest` (order-service) — real Testcontainers
+  Kafka + Schema Registry, reading the ACTUAL `avro-schemas/order-created.avsc`
+  file off disk rather than a hardcoded copy, replacing Step 3's manual
+  `curl` checks with three automated tests reproducing those exact,
+  live-verified results (an optional field with a default is compatible;
+  a REMOVED field is ALSO compatible, the surprising one; a required
+  field with no default is the one that's actually rejected, with Schema
+  Registry's own `READER_FIELD_MISSING_DEFAULT_VALUE` reason verified in
+  the response). Every module in this reactor with independent decision
+  logic worth testing now has real tests (`avro-schemas` isn't code;
+  `notification-service` was never built at all — see below). What
+  remains true, stated plainly: most OTHER "verified live" claims
+  scattered through this project's README walkthroughs are still exactly
+  that — a manual check performed once during development, not a
+  regression test that runs again on the next change. Testing coverage
+  now spans the platform's structural risk points (saga correctness,
+  Kafka Streams topology logic, Elasticsearch indexing, resilience
+  behavior, schema evolution) without covering everything every README
+  section ever claimed to have verified.
 - **`notification-service` was never built.** Still drawn as ⬜ in the
   root README's architecture diagram. Every other consumer of the
   platform's events exists; this one doesn't, simply because nothing

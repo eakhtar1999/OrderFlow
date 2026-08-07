@@ -81,6 +81,22 @@ embedded broker. Places an order over REST, then asserts BOTH the
 Postgres outbox row was actually relayed (deleted) — proving the whole
 outbox pattern ran, not just that the HTTP endpoint returned 202.
 
+`src/test/java/.../schema/SchemaCompatibilityContractTest.java` (Build
+Order Step 18) turns the root README's manual `curl` checks against
+Schema Registry's `/compatibility` endpoint into a real, automated
+contract test — a real Testcontainers Kafka + Schema Registry, reading
+the ACTUAL `../avro-schemas/order-created.avsc` file off disk (not a
+hardcoded copy). Three tests: adding an optional field with a default is
+backward compatible; removing a field entirely is ALSO backward
+compatible (the genuinely surprising result the root README documents
+finding live); adding a required field with no default is the one that
+actually gets rejected, with Schema Registry's own
+`READER_FIELD_MISSING_DEFAULT_VALUE` reason verified in the response.
+Lives here rather than in a dedicated module because `order-created.avsc`
+is this service's own event and Step 3's original live demo was done
+against it specifically — no Spring context needed at all, just Schema
+Registry's real compatibility engine over HTTP.
+
 ## What's deliberately NOT here yet
 
 - No REST-layer idempotency key handling (flagged in `OrderController`)

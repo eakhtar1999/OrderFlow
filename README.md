@@ -299,7 +299,23 @@ fix, and the comments point that out explicitly as you go.
       transport level — fixed with `http2PlainDisabled(true)`, a
       WireMock-specific quirk unrelated to the real services this test
       stands in for (Tomcat doesn't negotiate h2c by default either).
-      *(you are here)*
+- [x] **18. Avro schema-compatibility contract test** — the very last
+      gap Step 13's doc named. Turns the manual `curl` checks from
+      "Running Step 3 yourself" below into a real, automated test: real
+      Testcontainers Kafka + Schema Registry, reading the ACTUAL
+      `avro-schemas/order-created.avsc` file off disk rather than a
+      hardcoded copy. Three tests, matching the three real, live-verified
+      results from Step 3 — adding an optional field with a default is
+      backward compatible; removing a field entirely is ALSO backward
+      compatible (the genuinely surprising result); adding a required
+      field with no default is the one that's actually rejected, with
+      Schema Registry's own `READER_FIELD_MISSING_DEFAULT_VALUE` reason
+      verified in the response, not just a boolean. Found and fixed a
+      real container-ordering bug: two Testcontainers `@Container` fields
+      start in parallel by default, and Schema Registry's own startup
+      script failed to resolve Kafka's container network alias because
+      it tried before Kafka had finished starting — fixed with an
+      explicit `.dependsOn(kafka)`. *(you are here)*
 
 ## Running Step 1 yourself
 
@@ -1746,6 +1762,59 @@ run on Tomcat, which doesn't negotiate h2c by default either — this was a
 WireMock/Jetty-specific interop quirk this test setup needed to work
 around, not evidence of a latent bug in the actual services these tests
 stand in for.
+
+## Running Step 18 yourself (Avro schema-compatibility contract test)
+
+```bash
+mvn test -pl order-service -Dtest=SchemaCompatibilityContractTest
+```
+
+Real captured output:
+
+```
+Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 11.0 s
+BUILD SUCCESS
+```
+
+### A real environment bug, found live: two Testcontainers starting in parallel
+
+The very first run timed out entirely, before either compatibility check
+ran:
+
+```
+[ERROR] Container startup failed for image confluentinc/cp-schema-registry:7.7.0
+Caused by: ... Timed out waiting for URL to be accessible (http://localhost:.../subjects should return HTTP [200])
+```
+
+The Schema Registry container's own logs showed the actual cause:
+
+```
+WARN Couldn't resolve server PLAINTEXT://kafka:9092 from bootstrap.servers as DNS resolution failed for kafka
+```
+
+Both `@Container` fields (`kafka` and `schemaRegistry`) had no declared
+relationship between them, and Testcontainers starts multiple
+`@Container` fields in parallel by default — Schema Registry's own
+startup script tried to resolve the Kafka container's network alias
+before Kafka had finished starting and registering it on their shared
+Docker network. Fixed with one line: `.dependsOn(kafka)` on the Schema
+Registry container, forcing Kafka to be fully up first.
+
+### What the three tests actually verify
+
+All three re-derive the exact results the "Running Step 3 yourself"
+section above documents finding live — now checked automatically,
+against a real Schema Registry, every time this module's tests run,
+instead of only the one time someone ran the curl commands by hand:
+
+1. Adding an optional field with a default (`giftMessage`'s own real
+   history) → `is_compatible: true`.
+2. Removing a field entirely → ALSO `is_compatible: true` — the
+   surprising one, since BACKWARD compatibility only requires a new
+   reader schema to not demand something old data never had.
+3. Adding a REQUIRED field with no default → `is_compatible: false`,
+   with Schema Registry's own `READER_FIELD_MISSING_DEFAULT_VALUE`
+   message present in the response — the actual breaking case.
 
 ## Why Maven, why this module layout
 
