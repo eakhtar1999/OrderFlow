@@ -52,16 +52,39 @@ export class EcsClusterStack extends cdk.Stack {
     // ID) — the actual AMI ID differs per region and changes over
     // time as AWS patches it; this always resolves to whatever the
     // current recommended one is for the target region.
-    const machineImage = ecs.EcsOptimizedImage.amazonLinux2023();
+    //
+    // AmiHardwareType.ARM, not the default Standard (x86_64) — found
+    // live, the expensive way: Phase 1's Docker images were built on
+    // this project's own Apple Silicon development machine, which
+    // means `docker build` produced arm64 images by default (Docker
+    // matches the HOST architecture unless told otherwise). A
+    // cross-platform rebuild via `docker buildx build --platform
+    // linux/amd64` was attempted first, to keep these EC2 instances on
+    // the more common x86_64 architecture — and was killed after 92
+    // minutes still not finished. QEMU-based emulation (what buildx
+    // uses to cross-compile for a different CPU architecture) is a
+    // genuinely bad fit for compiling/running a JVM specifically: the
+    // JIT compiler's own dynamically-generated machine code changes
+    // constantly, which defeats QEMU's translation cache in a way
+    // static/AOT-compiled binaries don't suffer from — a widely-cited
+    // worst case for this class of emulation, confirmed here first-
+    // hand rather than taken on faith. The actual fix is simpler than
+    // rebuilding anything: match the EC2 instances' architecture to
+    // the images that ALREADY exist, not the other way around.
+    const machineImage = ecs.EcsOptimizedImage.amazonLinux2023(ecs.AmiHardwareType.ARM);
 
-    // ---- Kafka's dedicated capacity: 3x t3.small, FIXED size -------
+    // ---- Kafka's dedicated capacity: 3x t4g.small, FIXED size ------
     // min = max = desired = 3, on purpose — this pool exists for
     // exactly 3 Kafka broker ECS services, one instance each, no more,
     // no less, and no elastic scaling behavior to reason about.
+    // t4g (Graviton/ARM), not t3 (x86_64) — matches the arm64 Docker
+    // images from Phase 1 natively; see machineImage's own comment
+    // above for the full story of why. Same specs as t3.small (2 vCPU,
+    // 2GB RAM), still free-tier-eligible in this account.
     const kafkaAsg = new autoscaling.AutoScalingGroup(this, 'KafkaCapacityAsg', {
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
       machineImage,
       securityGroup: props.ecsInstanceSecurityGroup,
       associatePublicIpAddress: true,
@@ -92,23 +115,27 @@ export class EcsClusterStack extends cdk.Stack {
     const appAsg = new autoscaling.AutoScalingGroup(this, 'AppCapacityAsg', {
       vpc: props.vpc,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
-      // TEMPORARILY t3.small, not m7i-flex.large, while this phase is
-      // still validating the STACK ITSELF (up/down cycles, ECS
-      // registration, capacity provider wiring) rather than actually
-      // running the 12-container app tier — deliberately the cheapest
-      // free-tier-eligible option that's already proven reliable
-      // (matching Kafka's own instance type), to minimize cost during
-      // repeated up.sh/down.sh testing cycles. m7i-flex.large (2 vCPU,
-      // 8GB RAM — 4x the RAM here) is the right choice once this
-      // capacity pool actually needs to bin-pack Postgres, Redis,
-      // Elasticsearch, Schema Registry, and all 8 Spring Boot services
-      // — see this file's own comment history / git log for exactly
-      // when that swap happens. Also confirmed (see Phase 3's "found
-      // live" section) that t3.medium is REJECTED entirely in this
-      // account by a Free-Tier-only guardrail on ec2:RunInstances — the
-      // full eligible set here is c7i-flex.large, m7i-flex.large,
-      // t3.micro, t3.small, t4g.micro, t4g.small.
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+      // TEMPORARILY t4g.small while this phase is still validating the
+      // STACK ITSELF (up/down cycles, ECS registration, capacity
+      // provider wiring) rather than actually running the 12-container
+      // app tier — the cheapest free-tier-eligible option that's
+      // already proven reliable, matching Kafka's own instance type
+      // AND (see machineImage's comment above) the arm64 architecture
+      // Phase 1's Docker images actually are.
+      //
+      // A real constraint worth flagging for when this pool needs more
+      // RAM to bin-pack 12 real containers: this account's free-tier-
+      // eligible set (c7i-flex.large, m7i-flex.large, t3.micro,
+      // t3.small, t4g.micro, t4g.small — confirmed in Phase 3) has NO
+      // ARM option larger than t4g.small. Growing this pool later
+      // means either accepting MORE t4g.small instances (more
+      // instances, not bigger ones) or switching to an x86_64 type
+      // (m7i-flex.large) — which would need the 8 Spring Boot images
+      // rebuilt for linux/amd64 SOMEWHERE THAT ISN'T THIS LAPTOP'S
+      // QEMU emulation (a proper x86_64 build machine, or GitHub
+      // Actions' native x86_64 runners) — not decided yet, flagged for
+      // the phase that actually needs the answer.
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
       machineImage,
       securityGroup: props.ecsInstanceSecurityGroup,
       associatePublicIpAddress: true,

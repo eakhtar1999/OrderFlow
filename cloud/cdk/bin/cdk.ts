@@ -3,6 +3,7 @@ import * as cdk from 'aws-cdk-lib';
 import { BudgetStack } from '../lib/budget-stack';
 import { NetworkStack } from '../lib/network-stack';
 import { EcsClusterStack } from '../lib/ecs-cluster-stack';
+import { EcrStack } from '../lib/ecr-stack';
 
 const app = new cdk.App();
 
@@ -38,3 +39,12 @@ new EcsClusterStack(app, 'OrderFlowEcsClusterStack', {
   vpc: network.vpc,
   ecsInstanceSecurityGroup: network.ecsInstanceSecurityGroup,
 });
+
+// EcrStack has no dependency on the other three — it doesn't need the
+// VPC, the cluster, or the Security Groups, just an AWS account/region
+// to create repositories in. Independent stacks like this deploy in
+// whatever order `cdk deploy --all` decides (or in parallel, when
+// nothing forces sequencing) — no explicit ordering needed here the
+// way NetworkStack -> EcsClusterStack's real prop-passing dependency
+// requires it.
+new EcrStack(app, 'OrderFlowEcrStack', { env });

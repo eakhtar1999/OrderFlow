@@ -1055,3 +1055,221 @@ depending purely on which specific type/size you request —
 against the target account/region is the authoritative way to know the
 full eligible set ahead of time, rather than discovering it one failed
 launch at a time.
+
+---
+
+## Phase 4: `EcrStack` — pushing images to AWS
+
+### Why this stack needs nothing from the other three
+
+`EcrStack` doesn't reference the VPC, the Security Groups, or the ECS
+cluster — an ECR (Elastic Container Registry) repository is just
+storage for container images, with no networking or compute of its own.
+It's the one stack so far with zero cross-stack dependencies, which
+`bin/cdk.ts` reflects directly: no props are passed in from another
+stack's outputs the way `EcsClusterStack` needed `NetworkStack`'s `vpc`
+and `ecsInstanceSecurityGroup`.
+
+One property matters more here than anywhere else so far:
+`emptyOnDelete: true`. ECR refuses to delete a repository that still
+contains images by default — a sensible guard for a registry you
+depend on, but exactly the kind of thing that would make `cdk destroy`
+FAIL partway through given this project's whole cost-conscious,
+tear-down-between-sessions design. Same reasoning Build Order Step 16
+already applied to a different AWS-adjacent problem
+(`autoDeleteImages` on an Elasticsearch/S3-style resource), now applied
+to ECR specifically.
+
+### A real bug, found live, that would have been much more expensive to discover on AWS: architecture mismatch
+
+`docker image inspect orderflow/order-service:local --format '{{.Architecture}}'`
+came back `arm64`. Every one of Phase 1's 8 images does — this project's
+development machine is Apple Silicon, and `docker build` matches the
+HOST architecture by default unless told otherwise. The EC2 instances
+Phase 3 deployed (`t3.small`, `m7i-flex.large`) are `x86_64`. Had this
+gone unnoticed, `docker-push`-ing these images and pointing ECS at them
+would have produced a real, live failure mode on AWS: ECS placing tasks
+successfully, then every container immediately crash-looping with an
+`exec format error` — the kind of failure that's genuinely confusing to
+debug the FIRST time you hit it, because everything about the
+deployment (task definition, networking, IAM) can be completely
+correct, and it still won't run.
+
+The first fix attempted was rebuilding for the "more standard" x86_64
+target, via Docker's cross-platform build support:
+
+```bash
+docker buildx build --platform linux/amd64 -f order-service/Dockerfile -t orderflow/order-service:local --load .
+```
+
+This uses QEMU (a CPU emulator) to run x86_64 instructions on the
+arm64 host during the build. Killed after **92 minutes**, still not
+finished, for a build that takes under a minute natively. This is a
+real, well-documented worst case for this class of emulation, not a
+fluke: a JVM's JIT compiler generates NEW machine code continuously,
+at runtime, as it decides which methods are hot enough to optimize —
+and QEMU's own translation cache (the thing that makes emulation
+tolerable for STATIC binaries, which only need translating once) gets
+no benefit from code that's being freshly generated and immediately
+discarded on every run. Compiling AND running Maven/Java under full
+emulation compounds this twice over — the JVM compiling the Java source
+is itself getting emulated, and then the JIT-compiled output it
+produces adds a second, continuously-changing layer on top.
+
+**The actual fix was cheaper than the failed one**: match the
+INFRASTRUCTURE to the images that already exist, not the other way
+around. AWS Graviton (ARM-based, `t4g`/`m7g`/etc. instance families) is
+a first-class, fully-supported EC2 architecture — swapping
+`EcsClusterStack`'s instance types from `T3` to `T4G` and its AMI
+selection from the default `Standard` hardware type to
+`AmiHardwareType.ARM` (both real, one-line CDK changes) means the
+EXISTING arm64 images just work, unmodified, with zero rebuild:
+
+```typescript
+const machineImage = ecs.EcsOptimizedImage.amazonLinux2023(ecs.AmiHardwareType.ARM);
+// ...
+instanceType: ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.SMALL),
+```
+
+`t4g.small` is also free-tier-eligible in this account (confirmed back
+in Phase 3's own `describe-instance-types` check) — this fix didn't
+cost anything extra either. The one real constraint it creates, flagged
+for a later phase rather than solved now: this account's free-tier set
+has NO Graviton option larger than `t4g.small` — growing the app-tier
+pool's capacity later means either more `t4g.small` instances (not
+bigger ones) or accepting the need to properly cross-compile the 8
+Spring Boot images for x86_64 somewhere that isn't this laptop's local
+QEMU (a real x86_64 machine, or a CI runner with native x86_64
+hardware — GitHub Actions' standard runners, for instance).
+
+### `cloud/scripts/build-and-push.sh`
+
+Tags each already-built `orderflow/<service>:local` image with its ECR
+repository's URI and pushes it — deliberately does NOT rebuild anything
+(Phase 1's Dockerfiles already produce the exact artifact this script
+ships). ECR authentication uses the modern, two-step pattern:
+
+```bash
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "$REGISTRY"
+```
+
+rather than the older `aws ecr get-login` command, which used to print
+a complete `docker login` command — PASSWORD INCLUDED — to stdout,
+meaning it would land straight in your shell history the moment you
+ran it verbatim. `get-login-password` + `--password-stdin` gets the
+credential from AWS straight into `docker login`'s stdin, with the
+token never appearing in a command line or history file at all.
+
+Verified live — all 8 images pushed successfully:
+
+```bash
+$ ./cloud/scripts/build-and-push.sh
+...
+latest: digest: sha256:c935927f73538916f8e303434f36d9c4803806979e186103e25742f1a4b3f4cc size: 856
+All 8 images pushed.
+```
+
+One genuinely surprising thing, checked directly rather than assumed —
+`aws ecr describe-images` showed **3 images per repository**, not 1:
+
+```bash
+$ aws ecr describe-images --repository-name orderflow/order-service --query 'imageDetails[].{Tags:imageTags,Digest:imageDigest}'
+Digest: sha256:d02edb...   Tags: None
+Digest: sha256:342737...   Tags: None
+Digest: sha256:2cd1f5...   Tags: ['latest']
+```
+
+Only ONE digest carries the `latest` tag — the actual image manifest
+ECS will pull. The other two, untagged, are build **provenance/
+attestation manifests** Docker Buildx attaches automatically (visible
+during the Phase 1 build logs too, as "exporting attestation manifest"
+— easy to have scrolled past without registering what it meant at the
+time). ECR counts every distinct manifest object in a repository as an
+"image," whether or not anything ever references it directly by tag —
+this is normal, expected `docker push` behavior with a modern Buildx-
+based Docker installation, not evidence of 3 separate builds or a
+push gone wrong.
+
+---
+
+## 🎓 Concepts learned in Phase 4
+
+1. **`docker build` targets the HOST machine's CPU architecture by
+   default.** On Apple Silicon, that's `arm64` — a fact with zero
+   consequence for purely local development (the same machine builds
+   and runs the image), and a real, silent landmine the moment an
+   image needs to run somewhere else, unless the target's architecture
+   is checked explicitly.
+2. **QEMU-based cross-platform emulation is not a universal drop-in
+   fix** — it's genuinely excellent for many workloads and genuinely
+   terrible for others, and a JIT-compiling language runtime doing a
+   compile-heavy build (Maven, here) is close to the worst realistic
+   case. Knowing WHEN to reach for emulation versus WHEN to just match
+   the target platform to what you already have is a real, transferable
+   piece of judgment, not a Docker trivia fact.
+3. **Matching infrastructure to an existing artifact is often cheaper
+   than re-deriving the artifact for existing infrastructure.** Once an
+   arm64 image exists and works, Graviton EC2 instances are a
+   first-class target, not a workaround — reaching for x86_64 "because
+   it's more standard" would have been optimizing for a preference, not
+   a real requirement.
+4. **A repository's image count and its tagged-image count are
+   different numbers**, once a modern Buildx-based Docker client is
+   involved — attestation/provenance manifests are a real, automatic
+   part of a normal push, not something to investigate as a bug the
+   first time the numbers don't match 1:1.
+
+## 🧠 Interview Q&A
+
+**Q: You pushed a Docker image built on your Mac to a registry, and a
+Linux server now fails to run it. What's the first thing you'd check?**
+A: CPU architecture, before anything about the registry, the
+orchestrator config, or IAM permissions. `docker build` targets the
+host's own architecture by default — an Apple Silicon Mac produces
+`arm64` images unless `--platform` is specified explicitly. `docker
+image inspect <image> --format '{{.Architecture}}'` locally, compared
+against the target server's actual CPU architecture, answers this in
+one command, before spending time debugging something that LOOKS like
+a deployment/config problem but is actually a fundamentally different
+issue (the binary literally cannot execute on that CPU).
+
+**Q: When would you use QEMU-based cross-platform Docker builds versus
+just deploying to infrastructure matching your build machine's native
+architecture?**
+A: QEMU emulation is the right tool when you genuinely need artifacts
+for MULTIPLE architectures from ONE build machine (publishing a public
+image that other people's arm64 AND x86_64 machines both need to
+pull), or when the workload itself is emulation-friendly (mostly static
+binaries, limited dynamic code generation). It's the wrong tool when
+you control BOTH the build machine and the deployment target and only
+need ONE architecture — matching the deployment target to whatever the
+build machine already produces natively is faster and simpler. It's
+also specifically a poor fit for JIT-compiling runtimes (JVM, and
+similar dynamic-compilation languages) doing compile-heavy work, since
+the runtime's own continuously-regenerated machine code defeats
+emulation's translation caching in a way static binaries don't suffer
+from.
+
+**Q: Why authenticate to ECR with `aws ecr get-login-password | docker
+login --password-stdin` instead of simpler-looking alternatives?**
+A: The older `aws ecr get-login` command printed a complete, ready-to-
+run `docker login` command with the password embedded in plain text —
+convenient to copy-paste, but if you ever ran it as a literal shell
+command (rather than only eval-ing its output), that password landed
+in your shell history file. `get-login-password` returns ONLY the
+token, and piping it into `docker login`'s `--password-stdin` means the
+credential is never a literal command-line argument or logged anywhere
+— a real, if easy to overlook, credential-hygiene improvement in the
+newer pattern.
+
+**Q: Your container registry shows more images than you actually
+pushed. Is that a bug?**
+A: Not necessarily — check whether each extra entry has a tag. Modern
+Docker Buildx attaches build attestations (SLSA provenance, SBOMs) as
+separate, UNTAGGED manifests alongside the actual tagged image by
+default. A registry that counts every distinct manifest as an "image"
+(which ECR does) will show more entries than the number of `docker
+push` commands you ran — the real signal is which digest actually
+carries the tag you expect (`latest`, a version number, etc.); that's
+the one anything will actually pull and run.
