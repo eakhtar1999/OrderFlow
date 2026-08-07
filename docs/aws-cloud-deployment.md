@@ -423,3 +423,330 @@ services were checked, deliberately chosen because they have different
 dependency shapes (one needs Postgres+Redis+Kafka, the other needs only
 Kafka), to make sure the environment-variable-override pattern
 generalizes rather than happening to work for one lucky case.
+
+---
+
+## Phase 2: AWS CDK basics + the cost-safety net (`BudgetStack`)
+
+### Why the very first thing deployed is a Budget, not any actual infrastructure
+
+Nothing about a `docker build` costs money — every command in Phase 1
+ran entirely on a laptop. Everything from this point on creates REAL
+AWS resources with REAL, ongoing cost, against a hard, personal-money
+budget. Before creating anything else, this phase deploys exactly one
+thing: an automated early-warning system for that budget. If every
+later phase in this project got skipped and ONLY this one thing shipped,
+that would still be worth doing — it's the one piece of infrastructure
+whose entire job is protecting against every OTHER mistake.
+
+### Concept: what even is AWS CDK, and why not write raw CloudFormation or click through the console?
+
+**CloudFormation** is AWS's native infrastructure-as-code format — you
+write a JSON/YAML template describing every resource you want, AWS
+creates/updates/deletes them to match. It's powerful but verbose: even
+a simple resource often needs many lines of nested JSON, and there's no
+programming-language tooling (loops, functions, type checking) — just a
+declarative document.
+
+**AWS CDK (Cloud Development Kit)** lets you write the SAME kind of
+infrastructure description in a real programming language (TypeScript,
+here) instead. You don't hand-write CloudFormation — you write CDK code
+in TypeScript, and running `cdk synth` COMPILES it down into an actual
+CloudFormation template (see `cloud/cdk/cdk.out/*.template.json` after
+running it). CDK never talks to AWS directly to CREATE anything; it
+only ever produces a CloudFormation template, then hands that template
+to CloudFormation itself to actually execute. This matters for
+understanding what "deploy" really does (see below) and for debugging —
+when something goes wrong, the CloudFormation template CDK generated is
+always available to inspect directly, in plain JSON, with no CDK-
+specific knowledge required to read it.
+
+Why not just click through the AWS Console instead? Because a
+console click leaves no record anywhere except AWS's own audit log —
+there's no file in this repo you could look at a year from now to know
+EXACTLY what was created, and no reliable way to tear it all back down
+except manually finding and deleting each thing by hand. Everything in
+`cloud/cdk/` is the actual, complete, version-controlled specification
+of every AWS resource this deployment creates — `cdk destroy` can
+reverse ALL of it, precisely, because CDK/CloudFormation tracked
+exactly what it created.
+
+### CDK vocabulary, used precisely from here on
+
+- **App**: the whole CDK program — one `cdk.App()` instance
+  (`bin/cdk.ts`), which can contain multiple Stacks.
+- **Stack**: a deployable unit — maps 1:1 to a single CloudFormation
+  stack. `OrderFlowBudgetStack` is this project's first; later phases
+  add more (`NetworkStack`, `EcsClusterStack`, etc.), each independently
+  deployable and destroyable.
+- **Construct**: any reusable building block INSIDE a stack — a stack
+  itself is a construct, and everything you put inside one (like this
+  phase's `budgets.CfnBudget`) is also a construct. Constructs come in
+  three "levels":
+  - **L1 ("Cfn...")**: a near-literal, auto-generated mapping of one
+    CloudFormation resource type. `budgets.CfnBudget` (used in this
+    phase) is L1 — AWS Budgets has no higher-level construct, so this
+    is as good as it gets, and reading the underlying
+    [`AWS::Budgets::Budget` CloudFormation docs](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-budgets-budget.html)
+    directly is often unavoidable for these.
+  - **L2**: a hand-written, higher-level wrapper around one or more L1s,
+    with sane defaults and helper methods (e.g. `ec2.SecurityGroup`,
+    coming in a later phase) — most CDK code you'll see in the wild is
+    L2.
+  - **L3 ("patterns")**: whole common ARCHITECTURES bundled as one
+    construct (e.g. `ecs_patterns.ApplicationLoadBalancedFargateService`
+    creates an ALB + target group + ECS service + task definition all
+    at once) — a later phase for the app-tier services will likely lean
+    on one of these.
+- **Context**: per-deployment parameters, passed via `-c key=value` on
+  the CLI or read in code via `this.node.tryGetContext('key')` (used in
+  `BudgetStack` for the alert email). This is CDK's answer to "how do I
+  parameterize a stack without hardcoding a value into source" —
+  preferred over environment variables specifically because context
+  values are RECORDED in `cdk.context.json` and the synthesized
+  template's metadata, making a deployment's exact parameters
+  reproducible/auditable later, which a plain env var read at synth
+  time wouldn't be.
+
+### The actual commands, and what each one does (and does NOT do)
+
+```bash
+npm run build      # tsc: TypeScript -> JavaScript. Catches type errors.
+                    # Does NOT talk to AWS at all.
+
+cdk synth           # Runs your CDK app, produces a CloudFormation
+                    # template in cdk.out/. Still does NOT talk to AWS
+                    # to CREATE anything — synth only needs enough AWS
+                    # access to do CONTEXT LOOKUPS (e.g. "what AZs exist
+                    # in this account/region"), not to change anything.
+
+cdk diff             # Synthesizes, THEN compares the result against
+                     # what's ACTUALLY deployed right now (queries
+                     # CloudFormation for the current stack, if any).
+                     # Read-only — shows you what WOULD change without
+                     # changing anything. This is the step to run before
+                     # every single `cdk deploy`, no exceptions, once
+                     # real money is on the line.
+
+cdk deploy           # Submits the synthesized template to
+                     # CloudFormation as a "change set" (a preview of
+                     # exact changes), then executes it — THIS is the
+                     # one command in this list that actually creates/
+                     # updates/deletes real AWS resources.
+```
+
+### Two real environment gotchas, found live, neither AWS-specific
+
+**1. A corrupted npm cache from a stray `sudo npm install` at some
+point in the past:**
+
+```
+npm error code EACCES
+npm error Your cache folder contains root-owned files, due to a bug in
+npm error previous versions of npm which has since been addressed.
+npm error To permanently fix this problem, please run:
+npm error   sudo chown -R 501:20 "/Users/eakhtar/.npm"
+```
+
+npm's own suggested fix needs `sudo` — a system-level privilege change,
+not something to run without being asked to. The actual fix used here
+sidesteps it entirely: point npm at a fresh, throwaway cache directory
+for just this install (`npm install --cache /tmp/npm-cache-orderflow`),
+never touching the corrupted global one at all. This is a real, general
+technique worth knowing beyond this one project — `--cache <path>`
+works on nearly every npm command, not just `install`.
+
+**2. CDK CLI / library version skew:**
+
+```
+This CDK CLI is not compatible with the CDK library used by your application.
+Cloud assembly schema version mismatch: Maximum schema version supported
+is 53.x.x, but found 54.0.0. You need at least CLI version 2.1135.1 to
+read this manifest.
+```
+
+`cdk init` pins the `aws-cdk` (CLI) devDependency to whatever version
+was globally installed at scaffold time (2.1118.2 here) — but
+`aws-cdk-lib` (the actual construct LIBRARY your code imports) was
+declared with a caret range (`^2.248.0`), so `npm install` resolved it
+to the newest compatible release (2.263.0), which needs a newer CLI
+than what got pinned. **The CLI and the library are two SEPARATE npm
+packages that must stay roughly in sync**, and nothing enforces that
+automatically. Fixed by bumping the `aws-cdk` devDependency to match
+(`2.1135.1`, the minimum the error message itself named) and
+reinstalling.
+
+This is also the real reason to prefer running the LOCAL,
+project-pinned CDK CLI (`node_modules/.bin/cdk`, or `npx cdk` when it
+behaves — see below) over a globally-installed `cdk` command: a global
+install drifts out of sync with whatever `aws-cdk-lib` version any
+GIVEN project's `package.json` happens to pin, silently, until you hit
+exactly this error.
+
+**3. An environment-specific quirk, worth naming even though it isn't
+really a CDK problem**: `npx cdk <command>` produced completely silent,
+empty output in this specific terminal/sandbox environment (exit code
+0, but no visible stdout and no `cdk.out/` actually written) — while
+`node_modules/.bin/cdk <command>` (the exact same locally-installed
+binary `npx` would have found and run) worked correctly every time.
+Likely an `npx`-specific process-spawning quirk in this particular
+sandboxed shell, not a CDK issue — but the fix (call the local binary
+directly) is simple, and worth trying first any time `npx <anything>`
+produces suspiciously empty output with a "successful" exit code.
+
+### Verified live
+
+```bash
+$ node_modules/.bin/cdk diff --no-color
+Stack OrderFlowBudgetStack
+Resources
+[+] AWS::Budgets::Budget OrderFlowCloudBudget OrderFlowCloudBudget
+✨  Number of stacks with differences: 1
+```
+
+```bash
+$ node_modules/.bin/cdk deploy --no-color --require-approval never
+OrderFlowBudgetStack | 3/3 | CREATE_COMPLETE | AWS::CloudFormation::Stack | OrderFlowBudgetStack
+✅  OrderFlowBudgetStack
+✨  Deployment time: 10.55s
+```
+
+And directly against the AWS Budgets API, not just trusting CDK's own
+"success" message:
+
+```bash
+$ aws budgets describe-budget --account-id 383579119256 --budget-name orderflow-cloud-deployment
+{
+    "Budget": {
+        "BudgetName": "orderflow-cloud-deployment",
+        "BudgetLimit": { "Amount": "130.0", "Unit": "USD" },
+        "TimeUnit": "MONTHLY",
+        "CalculatedSpend": {
+            "ActualSpend": { "Amount": "0.0", "Unit": "USD" },
+            "ForecastedSpend": { "Amount": "0.125", "Unit": "USD" }
+        },
+        "HealthStatus": { "Status": "HEALTHY" }
+    }
+}
+
+$ aws budgets describe-subscribers-for-notification --account-id 383579119256 \
+    --budget-name orderflow-cloud-deployment \
+    --notification '{"NotificationType":"ACTUAL","ComparisonOperator":"GREATER_THAN","Threshold":80.0,"ThresholdType":"PERCENTAGE"}'
+{
+    "Subscribers": [{ "SubscriptionType": "EMAIL", "Address": "eakhtar1999@gmail.com" }]
+}
+```
+
+All 3 notification thresholds (`ACTUAL` 80%, `ACTUAL` 100%,
+`FORECASTED` 100%) confirmed live and correctly subscribed — no
+confirmation email needed at all, since AWS Budgets' native `EMAIL`
+subscriber type (used here) skips SNS's usual subscription-confirmation
+step entirely.
+
+---
+
+## 🎓 Concepts learned in Phase 2
+
+1. **CDK is a code generator for CloudFormation, not a replacement
+   execution engine.** `cdk synth` produces a plain CloudFormation
+   template; `cdk deploy` hands that template to CloudFormation, which
+   does the actual work. Understanding this makes "what does X command
+   actually touch" a much easier question — `synth`/`diff` are
+   read-only by construction (they can't be anything else, since they
+   never invoke CloudFormation's create/update APIs), only `deploy`
+   (and `destroy`) can.
+2. **L1 vs. L2 vs. L3 constructs is a real spectrum, not a hierarchy
+   you always climb.** Newer/less common AWS services often only HAVE
+   an L1 mapping — reaching for `CfnXxx` and reading the underlying
+   CloudFormation resource docs directly is completely normal CDK work,
+   not a sign you're doing something wrong.
+3. **CDK context values, not environment variables, are the idiomatic
+   way to parameterize a stack per-deployment** — because context gets
+   recorded alongside the synthesized template, making "what parameters
+   was this deployed with" answerable later, which a value read
+   silently from `process.env` at synth time isn't.
+4. **The CLI and the construct library are separate, independently-
+   versioned packages that must be kept roughly in sync** — a lesson
+   that generalizes past CDK to plenty of other "CLI tool + library your
+   code imports" pairings (this exact class of bug showed up earlier in
+   this project too, with Testcontainers' CLI/library version pinning
+   in Build Order Step 14).
+5. **Deploy the cost-safety net FIRST, verify it independently of the
+   tool that created it.** CDK reporting `✅ OrderFlowBudgetStack` is a
+   claim; querying the AWS Budgets API directly for the actual budget
+   amount, actual notification thresholds, and actual subscriber
+   address is the verification — the same "don't just trust the tool,
+   check the real state" discipline this whole project has followed
+   since Build Order Step 1.
+
+## 🧠 Interview Q&A
+
+**Q: What's the actual relationship between AWS CDK and
+CloudFormation?**
+A: CDK is a code-generation layer on top of CloudFormation, not a
+replacement for it. Writing CDK code and running `cdk synth` produces a
+literal CloudFormation template (JSON/YAML); `cdk deploy` submits that
+template to CloudFormation as a change set and executes it.
+CloudFormation is what actually creates, tracks, updates, and can roll
+back AWS resources — CDK never talks to individual AWS service APIs
+directly to provision infrastructure.
+
+**Q: What's the difference between an L1, L2, and L3 CDK construct?**
+A: L1 ("Cfn" prefix) is an auto-generated, near-1:1 mapping of a single
+CloudFormation resource type, with no added logic or sane defaults —
+you set every property yourself, matching the CloudFormation docs
+closely. L2 is a hand-authored wrapper around one or more L1s, adding
+sensible defaults, validation, and convenience methods. L3 ("patterns")
+bundles an entire common multi-resource architecture (e.g., a load-
+balanced Fargate service — ALB + target group + service + task
+definition) behind one construct. Not every AWS service has an L2 or
+L3; plenty of real infrastructure code is written directly against L1s.
+
+**Q: Why prefer CDK context values over environment variables for
+parameterizing a stack?**
+A: Context values passed via `-c key=value` (or read via
+`this.node.tryGetContext(...)`) get recorded in the CDK app's own
+`cdk.context.json` and are visible in the synthesized template's
+metadata — so a deployment's exact parameters are auditable and
+reproducible later. An environment variable read at synth time leaves
+no such record; six months later, nobody (including future-you) can
+tell what value was actually used just by looking at the repo.
+
+**Q: `cdk diff` shows no changes but you know you edited a construct.
+What would you check?**
+A: First, whether the build step actually ran (`npm run build`, or
+confirm your `cdk.json` app command runs TypeScript source directly via
+`ts-node` rather than stale compiled JS) — a stale compiled artifact
+sitting alongside fresh source is a classic silent-diff cause. Second,
+whether `cdk.out/` itself is stale (delete it and re-synth fresh).
+Third — and this is environment-specific, not a CDK concept — whether
+the CLI invocation itself is actually running correctly at all; an
+`npx`-wrapped command that exits 0 with suspiciously empty output,
+with no error, is worth re-running via the local binary directly
+(`node_modules/.bin/cdk`) before assuming the diff itself is wrong.
+
+**Q: You deployed a CDK stack and it reported success. How do you
+independently verify it actually did what you intended?**
+A: Query the actual AWS service's own API directly, not just trust the
+CDK/CloudFormation "success" message — a stack can report
+`CREATE_COMPLETE` while still containing a subtly wrong property value
+(wrong threshold, wrong email, wrong region) that only shows up if you
+go look at the live resource. Here, that meant `aws budgets
+describe-budget` and `aws budgets describe-subscribers-for-notification`
+against the real, deployed budget, confirming the dollar amount, the
+notification thresholds, and the subscriber address matched intent —
+not just reading CDK's own deploy log.
+
+**Q: Why does AWS Budgets' email notification not require a
+subscription-confirmation step, unlike a typical SNS topic
+subscription?**
+A: AWS Budgets supports two distinct subscriber types:
+`SubscriptionType: EMAIL` (Budgets sends the email itself, directly,
+with no SNS topic involved at all) and `SubscriptionType: SNS` (routes
+through an SNS topic you manage, which DOES require the usual
+subscription-confirmation flow for email-protocol SNS subscriptions).
+SNS-based subscriptions exist for programmatic use cases — triggering a
+Lambda, forwarding to Slack/PagerDuty via a webhook — where you need
+something other than a human reading an email. For a plain email
+alert, the native `EMAIL` subscriber type is simpler and has one fewer
+moving part.
