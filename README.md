@@ -21,6 +21,16 @@ For the requirements/architecture/trade-offs view of this whole project
 — what got built, what got deliberately scoped out, and why — see
 [`docs/system-design.md`](docs/system-design.md).
 
+Everything above is local — `docker-compose.yml` + `mvn spring-boot:run`,
+one machine. A separate, additive effort deploys this same platform to
+real AWS infrastructure (ECS, a genuine multi-broker Kafka cluster) to
+close the two gaps a single-broker local setup can never honestly
+demonstrate — broker failure/ISR/leader-election, and real
+multi-machine throughput numbers. See
+[`docs/aws-cloud-deployment.md`](docs/aws-cloud-deployment.md), written
+as a from-scratch, phase-by-phase build log for anyone who (like this
+project's own author, going in) doesn't yet know AWS CDK/ECS.
+
 ## Where we are right now
 
 **Build Order Steps 1–11 are done:** `order-service` publishes to Kafka;

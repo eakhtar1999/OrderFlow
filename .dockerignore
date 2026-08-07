@@ -1,0 +1,19 @@
+# Every `docker build` sends its ENTIRE context directory to the Docker
+# daemon before the build even starts, regardless of what a Dockerfile's
+# COPY instructions actually use — this file is what keeps that context
+# small and stale-artifact-free. Two concrete costs an empty
+# .dockerignore would have here: target/ directories across 8 modules
+# (locally-built .class files and jars we don't want silently reused
+# inside a container image meant to be built FRESH from source) and
+# .git/ (this repo's entire commit history, genuinely large, and never
+# needed inside a build).
+
+target/
+.git/
+.idea/
+.vscode/
+*.iml
+.DS_Store
+.claude/
+cloud/cdk/node_modules/
+cloud/cdk/cdk.out/
