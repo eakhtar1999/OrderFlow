@@ -750,3 +750,308 @@ Lambda, forwarding to Slack/PagerDuty via a webhook — where you need
 something other than a human reading an email. For a plain email
 alert, the native `EMAIL` subscriber type is simpler and has one fewer
 moving part.
+
+---
+
+## Phase 3: `NetworkStack` + `EcsClusterStack` — real, billable compute
+
+### `NetworkStack`: reusing the default VPC, on purpose
+
+`NetworkStack` does NOT create a new VPC. It calls
+`ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true })` — a real
+AWS API call, made at `cdk synth`/`cdk diff` time (not deploy time),
+that finds the account's EXISTING default VPC and reads back its
+subnet IDs, AZs, and CIDR ranges. This is why `bin/cdk.ts` had to set
+`env: { account, region }` explicitly back in Phase 2 — a lookup like
+this is meaningless without knowing exactly which account/region to
+look in.
+
+The bigger decision this stack makes: every EC2 instance in this
+project sits in a PUBLIC subnet, with NO NAT Gateway anywhere. The
+"textbook" production pattern puts compute in PRIVATE subnets (no
+direct route to the internet) behind a NAT Gateway for their outbound
+access — but a NAT Gateway costs real, ongoing money (~$0.045/hr plus
+per-GB data processing) for a benefit (network-layer isolation from
+inbound internet traffic) this deployment doesn't actually need,
+because **Security Groups already do that job** — a subnet being
+"public" only means it has a route to an Internet Gateway; it says
+NOTHING about which traffic is actually allowed to reach an instance
+inside it. `NetworkStack`'s two Security Groups are what actually
+enforces access control here: the ALB's group allows inbound HTTP from
+anywhere (it's supposed to be the public entry point); the EC2
+instances' group allows inbound ONLY from the ALB's group, plus a
+self-referencing rule so instances in the SAME group (every Kafka
+broker, every app service, every database) can reach each other. This
+is a real, deliberate, budget-driven trade-off — not a security best
+practice being recommended for a real production system, the same
+honest framing this project already gives `xpack.security.enabled=false`
+on local Elasticsearch.
+
+### `EcsClusterStack`: two capacity pools, for one real architectural reason
+
+The Kafka brokers need genuine failure isolation — killing one EC2
+instance must only ever take down ONE broker, for the whole point of
+this deployment (a real broker-failure/ISR/leader-election demo) to
+mean anything. That requirement is fundamentally incompatible with
+letting ECS bin-pack containers wherever it wants across an elastic
+pool, which is exactly the right behavior for the OTHER 12 containers
+(Postgres, Redis, Elasticsearch, Schema Registry, all 8 Spring Boot
+services) that have no such isolation requirement. Two ECS "capacity
+providers" — Kafka's own dedicated Auto Scaling Group (3 instances,
+pinned, one broker per instance via a placement constraint applied
+later when the actual Kafka services are created) and a second, shared
+Auto Scaling Group for everything else — is the direct expression of
+that one real requirement in infrastructure.
+
+### A real bug, found live: this AWS account only permits Free-Tier-eligible instance types
+
+The first deploy attempt used `t3.small` for Kafka's pool and
+`t3.medium` for the app-tier pool. Kafka's 3 instances launched fine —
+Watch:
+
+```bash
+$ aws autoscaling describe-auto-scaling-groups \
+    --query "AutoScalingGroups[?contains(AutoScalingGroupName,'KafkaCapacityAsg')].{Desired:DesiredCapacity,Instances:length(Instances)}"
+Desired: 3, Instances: 3   # healthy
+```
+
+but the app-tier pool never got a single instance, and the whole stack
+sat in `CREATE_IN_PROGRESS` for 45+ minutes with NO new CloudFormation
+events — genuinely stuck, not just slow. `describe-stack-events`
+doesn't explain WHY an `AWS::AutoScaling::AutoScalingGroup` resource is
+taking a long time (CloudFormation just waits for it to reach its
+desired capacity, silently, up to its own internal timeout) — the
+Auto Scaling Group's OWN activity log is what actually has the answer,
+and it's a much more direct diagnostic tool for exactly this situation:
+
+```bash
+$ aws autoscaling describe-scaling-activities --auto-scaling-group-name <app-asg-name>
+StatusCode: Failed
+StatusMessage: The specified instance type is not eligible for Free Tier.
+```
+
+This AWS account has a Free-Tier-only guardrail on `ec2:RunInstances`
+— almost certainly a Service Control Policy from whatever
+Activate/Educate/promotional program granted the account's credits,
+silently rejecting every `t3.medium` launch attempt (`t3.medium` isn't
+in the free tier; `t3.small`, the type Kafka happened to use, IS —
+pure coincidence that Kafka's pool worked and the app pool didn't).
+The error message itself names the fix:
+
+```bash
+$ aws ec2 describe-instance-types --filters Name=free-tier-eligible,Values=true \
+    --query 'InstanceTypes[].InstanceType'
+c7i-flex.large  t3.micro  t4g.small  t4g.micro  t3.small  m7i-flex.large
+```
+
+`m7i-flex.large` (2 vCPU, 8GiB RAM) is the best fit of that set for
+bin-packing 12 containers across 2 instances — 4x the RAM of `t3.small`,
+the next-largest eligible option. CDK has a proper enum for it
+(`ec2.InstanceClass.M7I_FLEX`), no raw string escape hatch needed.
+
+**The real operational lesson, independent of this specific error**:
+once a CloudFormation stack is `CREATE_IN_PROGRESS`, killing the LOCAL
+`cdk deploy` process does nothing to the actual, ongoing AWS-side
+operation — CloudFormation keeps retrying whatever it was doing
+regardless of whether anything local is still watching. There's also
+no direct "cancel a stuck CREATE" API the way `cancel-update-stack`
+exists for updates — the only way out of a stuck CREATE is to let it
+run to its own failure/timeout, at which point CloudFormation
+automatically rolls back EVERYTHING the stack created so far (in this
+case, terminating the 3 perfectly healthy Kafka instances too, since a
+failed CREATE has no concept of "partial success" to preserve). The
+practical response: fix the code immediately so the NEXT attempt
+succeeds, rather than trying to intervene in the stuck one, then
+redeploy fresh once the stack reaches a terminal (rolled-back) state.
+
+### Verified live: the redeploy, once fixed
+
+```bash
+$ node_modules/.bin/cdk deploy OrderFlowEcsClusterStack --no-color --require-approval never
+...
+OrderFlowEcsClusterStack | 36/36 | CREATE_COMPLETE | AWS::CloudFormation::Stack | OrderFlowEcsClusterStack
+✅  OrderFlowEcsClusterStack
+✨  Deployment time: 212.77s
+```
+
+3.5 minutes with the correct instance type, versus 65 minutes to fail
+with the wrong one — confirmed directly against both the ECS and EC2
+APIs, not just CDK's own success message:
+
+```bash
+$ aws ecs describe-clusters --clusters orderflow-cluster \
+    --query 'clusters[0].{status:status,registeredContainerInstances:registeredContainerInstancesCount}'
+{ "status": "ACTIVE", "registeredContainerInstances": 5 }
+
+$ aws ec2 describe-instances --filters Name=tag:aws:cloudformation:stack-name,Values=OrderFlowEcsClusterStack \
+    Name=instance-state-name,Values=running --query 'Reservations[].Instances[].{Type:InstanceType,State:State.Name}'
+t3.small        running   (x3, Kafka capacity)
+m7i-flex.large  running   (x2, app-tier capacity)
+```
+
+All 5 EC2 instances running, all 5 registered as ECS container
+instances, cluster `ACTIVE`.
+
+### `cloud/scripts/up.sh` / `down.sh`: the actual cost lever for a fixed-budget window
+
+Two scripts, deliberately asymmetric with what they touch:
+
+- **`down.sh`** destroys ONLY `OrderFlowEcsClusterStack` — the 5 EC2
+  instances, the only resources in this whole project that cost money
+  so far. `OrderFlowBudgetStack` and `OrderFlowNetworkStack` are left
+  running, because both cost $0 to exist, and leaving `NetworkStack` up
+  means `up.sh` never has to recreate the VPC lookup/Security Groups.
+- **`up.sh`** redeploys `NetworkStack` (fast no-op if nothing changed)
+  then `EcsClusterStack` (recreates the 5 instances from scratch).
+
+Both use `--force`/`--require-approval never` deliberately — the whole
+point of these two scripts is a fast, unattended, repeatable up/down
+cycle between work sessions, not a guarded one-off action. This is safe
+specifically BECAUSE `EcsClusterStack` currently owns nothing stateful
+worth protecting (no Kafka topic data, no database rows exist yet at
+this phase) — `down.sh`'s own comment flags this explicitly as a
+trade-off that stops being automatically safe once later phases add
+real data to these instances' local disks.
+
+Verified live, both directions, not just written and assumed to work:
+
+```bash
+$ ./cloud/scripts/down.sh
+Tearing down OrderFlowEcsClusterStack (all 5 EC2 instances)...
+... (34 resources, in dependency order: Lambda drain hooks -> capacity
+    providers -> the 2 ASGs -> launch templates -> IAM roles -> the
+    ECS cluster itself)
+✅  OrderFlowEcsClusterStack: destroyed
+# Confirmed separately: `aws ec2 describe-instances
+# --filters Name=instance-state-name,Values=running` returned nothing.
+
+$ ./cloud/scripts/up.sh
+Bringing up OrderFlowNetworkStack + OrderFlowEcsClusterStack...
+✅  OrderFlowEcsClusterStack
+✨  Deployment time: 206.41s
+```
+
+### Mid-testing instance downsize, and a genuinely useful cancellation trick
+
+While repeatedly cycling `down.sh`/`up.sh` for this exact verification,
+it became clear the app-tier pool's `m7i-flex.large` (8GB RAM) is
+overkill for a phase that's only validating the STACK MECHANICS (does
+`up`/`down` actually work cleanly) rather than running the real
+12-container app tier yet — swapped to `t3.small` (matching Kafka's
+pool) for the remainder of this testing phase, to minimize cost during
+what's likely to be many more up/down cycles before later phases
+actually need the extra RAM.
+
+The genuinely reusable technique from making that swap mid-deploy:
+`up.sh` was already `CREATE_IN_PROGRESS` (past the point where killing
+the LOCAL `cdk deploy` process does anything useful — see Phase 3's
+earlier note on this) when the decision to downsize came in. Checking
+progress first (`aws cloudformation describe-stack-events`) showed only
+3 of 36 resources had been created — cheap ones (IAM roles, SNS topics),
+no ASG, no EC2 instances yet. Rather than waiting for the whole
+(expensive) creation to finish and then tearing it down again, a direct
+
+```bash
+aws cloudformation delete-stack --stack-name OrderFlowEcsClusterStack
+```
+
+against the STILL-`CREATE_IN_PROGRESS` stack cancelled it cleanly —
+CloudFormation rolled back exactly the 3 resources that existed and
+never proceeded to create anything costly. This is a real, useful
+distinction from the earlier "can't cancel a stuck CREATE" finding: that
+one was about a stack ALREADY STUCK waiting on a slow/failing resource
+with no clean way out; THIS is proactively cancelling a healthy,
+still-in-progress creation before it reaches the expensive part —
+`delete-stack` accepts this immediately precisely because nothing
+blocking has happened yet.
+
+---
+
+## 🎓 Concepts learned in Phase 3
+
+1. **Public subnet + Security Groups can be a legitimate substitute for
+   private subnet + NAT Gateway** when the thing you're protecting
+   against is inbound access, not "does this instance have a route to
+   the internet at all" — the two mechanisms answer genuinely different
+   questions, and knowing which one you actually need saves real money.
+2. **A resource-isolation requirement (Kafka's "one broker per
+   instance") is a real architectural constraint that shapes
+   infrastructure design directly** — it's the entire reason this
+   stack has two capacity pools instead of one simpler shared one.
+3. **`describe-stack-events` tells you WHAT CloudFormation is doing;
+   it often doesn't tell you WHY something is stuck.** For a specific
+   resource type stuck `IN_PROGRESS`, that resource's own service-level
+   API (here, `autoscaling describe-scaling-activities`) is frequently
+   the tool with the actual answer.
+4. **A stuck `CREATE_IN_PROGRESS` CloudFormation operation cannot be
+   safely cancelled locally** — the AWS-side state machine runs
+   independently of whatever CLI process happened to kick it off.
+   Fix the root cause, then let the current attempt fail/roll back on
+   its own before retrying.
+5. **AWS accounts under promotional/educational credit programs often
+   carry invisible-until-you-hit-them guardrails** (here: a Free-Tier-
+   only instance-type restriction) that a "standard" AWS account
+   wouldn't have — worth checking `describe-instance-types
+   --filters Name=free-tier-eligible,Values=true` EARLY in any project
+   under this kind of account, not after a failed deploy.
+
+## 🧠 Interview Q&A
+
+**Q: Why put EC2 instances in a public subnet instead of the
+"standard" private-subnet-plus-NAT-Gateway pattern?**
+A: Because the actual threat being defended against (unwanted inbound
+traffic) is a Security Group's job, not a subnet-routing job — a
+public subnet only means "has a route to an Internet Gateway," it says
+nothing about which traffic a Security Group actually permits to reach
+an instance sitting in it. NAT Gateway's real value is giving PRIVATE
+(no-inbound-route-at-all) instances outbound internet access without
+exposing them to inbound connections — a genuinely different property,
+worth its ongoing cost when you need true network-layer isolation
+(e.g., compliance requirements, defense-in-depth for a real production
+system), and reasonably skippable for a budget-constrained portfolio
+deployment where Security Groups alone provide adequate access control.
+
+**Q: When would you use two separate ECS capacity providers/Auto
+Scaling Groups instead of one shared pool?**
+A: When some subset of your workload has a placement requirement
+ordinary bin-packing can't satisfy — most commonly, genuine per-
+instance failure isolation (stateful, clustered systems like Kafka,
+where you need to guarantee two replicas never land on the same
+physical/virtual host) or a hardware requirement a subset of tasks
+needs that the rest don't (GPU instances for one workload, standard
+compute for everything else). Splitting capacity pools is the
+mechanism; a real, specific reason to need isolation or specialized
+hardware is the justification — doing it "just in case" adds
+operational complexity (more instance types to manage, less efficient
+overall utilization) without a concrete payoff.
+
+**Q: A CloudFormation stack has been `CREATE_IN_PROGRESS` for far
+longer than expected. What do you actually check, and can you cancel
+it?**
+A: Start with `describe-stack-events` to see the most recent resource
+each event touched — but if the events go quiet with no new activity,
+that resource's own service-specific API is usually the better next
+step (an Auto Scaling Group's `describe-scaling-activities`, an ECS
+service's `describe-services` events, etc.) — these often surface the
+EXACT failure reason CloudFormation's own event stream doesn't. As for
+cancelling: there's no direct "cancel a stuck CREATE" API — that only
+exists for UPDATE operations (`cancel-update-stack`). A stuck CREATE
+has to either succeed or fail/timeout on its own; CloudFormation then
+automatically rolls back everything the stack created, with no partial-
+success option. The practical move is fixing the root cause immediately
+so the next attempt succeeds, then waiting for the current one to reach
+a terminal state before retrying — not trying to force an in-flight
+operation to stop.
+
+**Q: Why did some instance types succeed and others fail with the same
+error, in the same account, same region, same deploy?**
+A: AWS's Free Tier eligibility is defined PER INSTANCE TYPE, not
+account-wide — `t3.small` is free-tier-eligible, `t3.medium` is not, in
+the exact same family. A Service-Control-Policy-style guardrail
+restricting launches to free-tier-eligible types will therefore permit
+some types and reject others within the same instance family,
+depending purely on which specific type/size you request —
+`describe-instance-types --filters Name=free-tier-eligible,Values=true`
+against the target account/region is the authoritative way to know the
+full eligible set ahead of time, rather than discovering it one failed
+launch at a time.
