@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
 import { BudgetStack } from '../lib/budget-stack';
+import { NetworkStack } from '../lib/network-stack';
+import { EcsClusterStack } from '../lib/ecs-cluster-stack';
 
 const app = new cdk.App();
 
@@ -10,11 +12,29 @@ const app = new cdk.App();
 // `cdk deploy`/`cdk synth`. Explicitly setting `env` (rather than
 // leaving a stack "environment-agnostic," the scaffolded default) is
 // what unlocks account/region-AWARE features — Cost Explorer lookups
-// here, and later, Cloud Map/ECS constructs that need to know which
-// VPC/AZs actually exist in this specific account.
+// in BudgetStack, and NetworkStack's `Vpc.fromLookup` (a real API call
+// that needs to know exactly which account/region to look IN).
 const env = {
   account: process.env.CDK_DEFAULT_ACCOUNT,
   region: process.env.CDK_DEFAULT_REGION,
 };
 
 new BudgetStack(app, 'OrderFlowBudgetStack', { env });
+
+// NetworkStack and EcsClusterStack are two SEPARATE CDK Stack objects,
+// but not two separate CloudFormation exports/imports by hand — CDK
+// wires the cross-stack reference automatically. Passing
+// `network.vpc`/`network.ecsInstanceSecurityGroup` directly as
+// constructor props (rather than, say, looking them up again by ARN)
+// is what makes CDK generate the actual CloudFormation
+// Export/Fn::ImportValue plumbing for you, and — just as importantly —
+// what makes CDK understand these two stacks now have a REAL
+// dependency: `cdk deploy` will always deploy NetworkStack before
+// EcsClusterStack, in that order, without needing to be told to.
+const network = new NetworkStack(app, 'OrderFlowNetworkStack', { env });
+
+new EcsClusterStack(app, 'OrderFlowEcsClusterStack', {
+  env,
+  vpc: network.vpc,
+  ecsInstanceSecurityGroup: network.ecsInstanceSecurityGroup,
+});
