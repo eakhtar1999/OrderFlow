@@ -65,7 +65,7 @@ comparisons but also not built — see §7.6 and §8.
 | Data durability across infra restarts | ✅ Postgres/Redis/Elasticsearch via named volumes; Kafka's own volume mount was BROKEN until Step 12 — see §7.9 |
 | Horizontal scalability of stateless consumers | ✅ Demonstrated (inventory-service, 2 instances, live rebalance) — not load-tested under real throughput, see §8 |
 | Throughput/latency SLAs, benchmarked | ⬜ Not measured. `claude.md` §4 Performance asks for "basic load testing... throughput benchmarks across different partition counts" — never run. Single-broker, single-laptop Docker Compose isn't a meaningful environment for this anyway; flagged as future work, not attempted here |
-| Fault tolerance across broker failure (ISR/leader election) | ⬜ Not demonstrated. `replicas(1)` on every topic (see §7.9) — this project's single-broker KRaft cluster has zero replication, so there is no leader-election failover TO demonstrate without first standing up a 3-broker cluster, which is out of scope for a laptop tutorial |
+| Fault tolerance across broker failure (ISR/leader election) | ✅ Demonstrated live on the AWS cloud deployment (`docs/aws-cloud-deployment.md`, Phase 6) — a real 3-broker KRaft cluster (Phase 5a), the current controller leader's EC2 instance killed for real, the 2 survivors independently electing a new leader in 6 seconds, cross-verified in both brokers' own logs. Still `replicas(1)` on the LOCAL single-broker docker-compose stack (see §7.9) — this gap is closed specifically by the separate AWS deployment, not by a change to local |
 | Automated test coverage | ✅ Steps 14-17 gave every module with independent decision logic real tests (Testcontainers integration tests for the 4 choreography-saga services + search-indexer-service, `TopologyTestDriver` unit tests for both Kafka Streams apps, Testcontainers+WireMock tests for order-saga-orchestrator). Step 18 closed the last named gap: a real, automated Avro schema-compatibility contract test (below), replacing the manual `curl` checks from Step 3. See §8 for the still-honest caveat (most "verified live" claims elsewhere in this project remain manual, one-time checks, not regression tests) |
 
 ## 4. High-level architecture
@@ -431,15 +431,27 @@ know it actually persists is to tear the container down and check.
   between what the code promised and what got written. Fixed as part of
   writing this doc: those comments now point here instead of a page that
   doesn't exist.
-- **ISR / leader election / broker-failure simulation is not
-  demonstrated**, for the structural reason that this project's
-  single-broker KRaft cluster has `replicas(1)` on every topic — there
-  is no second replica to fail over TO. Demonstrating this meaningfully
-  needs a 3-broker compose stack, out of scope for what's currently a
-  single-container Kafka setup.
+- **ISR / leader election / broker-failure simulation — closed on the
+  AWS deployment, still an open gap locally.** The LOCAL single-broker
+  KRaft cluster still has `replicas(1)` on every topic — there's still
+  no second local replica to fail over to, and that's an intentional,
+  unchanged simplification for a single-laptop tutorial. But
+  `docs/aws-cloud-deployment.md`'s Phase 6 demonstrates this for real,
+  on a genuine 3-broker cluster: the current controller leader's
+  underlying EC2 instance was killed outright, and the 2 surviving
+  brokers independently elected a new leader within 6 seconds —
+  cross-verified in both survivors' own logs, not inferred from one
+  broker's self-report. That same session also surfaced a real,
+  separate finding worth naming here: the FAST server-side election did
+  not mean instant client-side recovery — an in-flight Kafka
+  transaction (pinned to the now-dead broker as its coordinator) took
+  the full `transaction.timeout.ms` to notice and recover, a genuinely
+  different timescale from the consensus layer's own recovery.
 - **No throughput benchmarking across partition counts or replication
-  factors** — `claude.md` §4 asks for this explicitly; never run,
-  same single-broker/single-laptop constraint as above.
+  factors** — `claude.md` §4 asks for this explicitly; never run.
+  Phase 6's live broker-kill demo used the real 3-broker AWS cluster
+  for failover verification, not throughput measurement — this
+  specific gap remains open even there.
 - **Static group membership (`group.instance.id`) and batch listeners**
   are both explained in code comments but never actually configured or
   implemented anywhere in the 8 services.
