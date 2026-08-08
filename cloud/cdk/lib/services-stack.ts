@@ -67,6 +67,21 @@ export class ServicesStack extends cdk.Stack {
       ec2.Port.tcp(8085),
       'Schema Registry HTTP traffic',
     );
+    this.internalSecurityGroup.addIngressRule(
+      this.internalSecurityGroup,
+      ec2.Port.tcp(5432),
+      'Postgres traffic',
+    );
+    this.internalSecurityGroup.addIngressRule(
+      this.internalSecurityGroup,
+      ec2.Port.tcp(6379),
+      'Redis traffic',
+    );
+    this.internalSecurityGroup.addIngressRule(
+      this.internalSecurityGroup,
+      ec2.Port.tcp(9200),
+      'Elasticsearch HTTP traffic',
+    );
 
     // PrivateDnsNamespace: the actual Cloud Map + Route 53 private
     // hosted zone machinery behind "kafka-1.orderflow.local" resolving
@@ -99,6 +114,20 @@ export class ServicesStack extends cdk.Stack {
     }
 
     this.createSchemaRegistry(props);
+
+    // Phase 5b: the 3 stateful dependencies the 8 Spring Boot services
+    // (Phase 5c) will need — Postgres (order-service's outbox source of
+    // truth), Redis (cache-aside/dedupe/rate-limit/lock, all sharing
+    // one instance the same way the local docker-compose.yml does —
+    // see that file's own comment for why), and Elasticsearch
+    // (search-indexer-service's target). None of these need
+    // `distinctInstances` placement — unlike the Kafka brokers, there's
+    // only ONE of each here, so there's no "spread across instances"
+    // question to force; they simply bin-pack onto the app-tier pool
+    // like Schema Registry already does.
+    this.createPostgres(props);
+    this.createRedis(props);
+    this.createElasticsearch(props);
   }
 
   private createKafkaBroker(
@@ -238,6 +267,166 @@ export class ServicesStack extends cdk.Stack {
       securityGroups: [this.internalSecurityGroup],
       cloudMapOptions: {
         name: 'schema-registry',
+        cloudMapNamespace: this.namespace,
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+      },
+      enableExecuteCommand: true,
+    });
+  }
+
+  private createPostgres(props: ServicesStackProps) {
+    const taskDefinition = new ecs.Ec2TaskDefinition(this, 'PostgresTaskDef', {
+      networkMode: ecs.NetworkMode.AWS_VPC,
+      // No chown needed on the host side — see EcsClusterStack's own
+      // UserData comment: postgres:16's entrypoint runs AS root and
+      // chowns its own data directory internally before dropping to
+      // its unprivileged runtime user, unlike Kafka/Elasticsearch.
+      volumes: [{ name: 'postgres-data', host: { sourcePath: '/data/postgres' } }],
+    });
+
+    const container = taskDefinition.addContainer('PostgresContainer', {
+      image: ecs.ContainerImage.fromRegistry('postgres:16'),
+      memoryReservationMiB: 512,
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'postgres',
+        logGroup: new logs.LogGroup(this, 'PostgresLogGroup', {
+          logGroupName: '/orderflow/postgres',
+          retention: logs.RetentionDays.THREE_DAYS,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+      // Same credentials as the local docker-compose.yml on purpose —
+      // order-service's `spring.datasource.*` properties already
+      // default to these locally; matching them here means the 8 app
+      // services (Phase 5c) need zero code changes, only an
+      // environment variable pointing `spring.datasource.url` at
+      // `postgres.orderflow.local` instead of `localhost`.
+      environment: {
+        POSTGRES_USER: 'orderflow',
+        POSTGRES_PASSWORD: 'orderflow',
+        POSTGRES_DB: 'orderflow',
+      },
+      portMappings: [{ containerPort: 5432, protocol: ecs.Protocol.TCP }],
+    });
+    container.addMountPoints({
+      sourceVolume: 'postgres-data',
+      containerPath: '/var/lib/postgresql/data',
+      readOnly: false,
+    });
+
+    new ecs.Ec2Service(this, 'PostgresService', {
+      cluster: props.cluster,
+      taskDefinition,
+      serviceName: 'postgres',
+      desiredCount: 1,
+      capacityProviderStrategies: [{ capacityProvider: props.appCapacityProviderName, weight: 1 }],
+      securityGroups: [this.internalSecurityGroup],
+      cloudMapOptions: {
+        name: 'postgres',
+        cloudMapNamespace: this.namespace,
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+      },
+      enableExecuteCommand: true,
+    });
+  }
+
+  private createRedis(props: ServicesStackProps) {
+    // No bind-mount volume — matching the local docker-compose.yml
+    // exactly, which also gives Redis no persistent volume. All 4 of
+    // Redis's use cases here (cache-aside, dedupe store, rate limiter,
+    // distributed lock — see docker-compose.yml's own comment) are
+    // legitimately fine losing their contents on a restart: Postgres
+    // remains the source of truth for the cache, dedupe/rate-limit
+    // state is meant to be short-TTL anyway, and a lost lock just gets
+    // re-acquired.
+    const taskDefinition = new ecs.Ec2TaskDefinition(this, 'RedisTaskDef', {
+      networkMode: ecs.NetworkMode.AWS_VPC,
+    });
+
+    taskDefinition.addContainer('RedisContainer', {
+      image: ecs.ContainerImage.fromRegistry('redis:7'),
+      memoryReservationMiB: 128,
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'redis',
+        logGroup: new logs.LogGroup(this, 'RedisLogGroup', {
+          logGroupName: '/orderflow/redis',
+          retention: logs.RetentionDays.THREE_DAYS,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+      portMappings: [{ containerPort: 6379, protocol: ecs.Protocol.TCP }],
+    });
+
+    new ecs.Ec2Service(this, 'RedisService', {
+      cluster: props.cluster,
+      taskDefinition,
+      serviceName: 'redis',
+      desiredCount: 1,
+      capacityProviderStrategies: [{ capacityProvider: props.appCapacityProviderName, weight: 1 }],
+      securityGroups: [this.internalSecurityGroup],
+      cloudMapOptions: {
+        name: 'redis',
+        cloudMapNamespace: this.namespace,
+        dnsRecordType: servicediscovery.DnsRecordType.A,
+      },
+      enableExecuteCommand: true,
+    });
+  }
+
+  private createElasticsearch(props: ServicesStackProps) {
+    const taskDefinition = new ecs.Ec2TaskDefinition(this, 'ElasticsearchTaskDef', {
+      networkMode: ecs.NetworkMode.AWS_VPC,
+      // Host directory pre-created and chowned to uid 1000 by
+      // EcsClusterStack's appAsg UserData — elasticsearch:8.15.0 has
+      // an explicit `USER 1000:0` Dockerfile directive (confirmed via
+      // `docker inspect`), so it never runs as root the way postgres/
+      // redis do, and would hit the exact same crash-loop Phase 5a's
+      // Kafka brokers hit without this.
+      volumes: [{ name: 'es-data', host: { sourcePath: '/data/elasticsearch' } }],
+    });
+
+    const container = taskDefinition.addContainer('ElasticsearchContainer', {
+      image: ecs.ContainerImage.fromRegistry('docker.elastic.co/elasticsearch/elasticsearch:8.15.0'),
+      // Reservation comfortably above the capped 512m JVM heap —
+      // Elasticsearch/Lucene use significant off-heap memory (mmap'd
+      // segment files, native buffers) beyond the heap itself, the
+      // same reasoning the local docker-compose.yml's own
+      // ES_JAVA_OPTS comment already calls out.
+      memoryReservationMiB: 900,
+      logging: ecs.LogDrivers.awsLogs({
+        streamPrefix: 'elasticsearch',
+        logGroup: new logs.LogGroup(this, 'ElasticsearchLogGroup', {
+          logGroupName: '/orderflow/elasticsearch',
+          retention: logs.RetentionDays.THREE_DAYS,
+          removalPolicy: cdk.RemovalPolicy.DESTROY,
+        }),
+      }),
+      // Identical to docker-compose.yml's own settings — single-node
+      // mode and disabled security are the same deliberate dev-only
+      // simplification on AWS as they already are locally; see that
+      // file's own comment for the full reasoning.
+      environment: {
+        'discovery.type': 'single-node',
+        'xpack.security.enabled': 'false',
+        ES_JAVA_OPTS: '-Xms512m -Xmx512m',
+      },
+      portMappings: [{ containerPort: 9200, protocol: ecs.Protocol.TCP }],
+    });
+    container.addMountPoints({
+      sourceVolume: 'es-data',
+      containerPath: '/usr/share/elasticsearch/data',
+      readOnly: false,
+    });
+
+    new ecs.Ec2Service(this, 'ElasticsearchService', {
+      cluster: props.cluster,
+      taskDefinition,
+      serviceName: 'elasticsearch',
+      desiredCount: 1,
+      capacityProviderStrategies: [{ capacityProvider: props.appCapacityProviderName, weight: 1 }],
+      securityGroups: [this.internalSecurityGroup],
+      cloudMapOptions: {
+        name: 'elasticsearch',
         cloudMapNamespace: this.namespace,
         dnsRecordType: servicediscovery.DnsRecordType.A,
       },
