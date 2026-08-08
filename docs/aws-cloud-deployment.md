@@ -1958,4 +1958,384 @@ persistence; a system of record (a database holding data with no other
 copy) is not. The question to ask is "what actually breaks if this
 process restarts with an empty disk," not "is this the kind of thing
 that usually gets a volume."
+
+---
+
+## Phase 5c: `AppServicesStack` — the 8 Spring Boot services + ALB, and a real order end-to-end on AWS
+
+The payoff phase. Every prior phase built infrastructure; this one runs
+the actual application and proves it works — placing a real order
+through a public URL and watching it complete the full choreography
+saga (order-service → Kafka → inventory/payment/shipment-service →
+back to order-service) on AWS, not a laptop. This phase also surfaced
+more real, live bugs than 5a and 5b combined — each one left in this
+document because the debugging process is the actual teaching material,
+not just the final working state.
+
+### The design: one shared ALB, path-based routing, 3 internal-only services
+
+All 8 services are `Ec2Service`s on the app-tier capacity pool, same
+pattern as Phase 5b's Postgres/Redis/Elasticsearch — no
+`distinctInstances` constraint, since there's only ONE of each. 5 of
+the 8 have their own REST API worth reaching from outside the VPC
+(order-service, fraud-detection-service, analytics-service,
+order-saga-orchestrator, search-indexer-service) and get an ALB
+`ApplicationTargetGroup` + a path-based listener rule
+(`/orders/*`, `/fraud/*`, `/analytics/*`, `/saga/*`, `/search/*`). The
+other 3 (inventory-service, payment-service, shipment-service) are
+internal-only — reached purely via Cloud Map by the orchestrator and
+each other, exactly matching how they're used locally, where nothing
+outside the platform ever calls them directly.
+
+**Zero Java code changes anywhere in this phase.** Every address each
+service needs was already an externalized Spring Boot property with a
+`localhost` default (confirmed by reading all 8 `application.yml`
+files directly before writing any CDK code, not assumed) —
+`SPRING_DATASOURCE_URL`, `SPRING_DATA_REDIS_HOST`,
+`SPRING_KAFKA_BOOTSTRAP_SERVERS`,
+`SPRING_KAFKA_{PRODUCER,CONSUMER,STREAMS}_PROPERTIES_SCHEMA_REGISTRY_URL`,
+`SPRING_ELASTICSEARCH_URIS`, and
+`SERVICES_{INVENTORY,PAYMENT,SHIPMENT}_SERVICE_BASE_URL` for
+order-saga-orchestrator's direct HTTP calls — all overridden purely via
+environment variables in each ECS task definition, pointed at Cloud Map
+DNS names instead of `localhost`.
+
+### JVM memory tuning: `JAVA_TOOL_OPTIONS`, not a Dockerfile change
+
+8 more JVMs need to safely bin-pack alongside Phase 5b's 4 backing
+services on `t4g.small` instances. Rather than let JVM ergonomics size
+each service's default heap off the HOST's full 2 GiB (visible to every
+container, since only a SOFT `memoryReservationMiB` is set, not a hard
+`memory` limit), every task gets `JAVA_TOOL_OPTIONS: "-Xmx<N>m
+-Xss512k"` — a JVM launcher environment variable, picked up
+automatically with zero Dockerfile change, since every one of Phase 1's
+Dockerfiles ends in a direct `ENTRYPOINT ["java", "-jar", ...]` (checked
+directly, not assumed). Kafka Streams services
+(fraud-detection-service, analytics-service) get more headroom (384m
+heap, 550 MiB reservation) than the plain consumer/producer services
+(256m heap, 350-400 MiB reservation), reflecting RocksDB state store
+overhead the plain services don't have.
+
+### Bug 1, caught before it ever touched AWS: an invalid security-group rule description
+
+`cdk deploy` failed immediately with:
+
+```
+Resource handler returned message: "Invalid rule description. Valid descriptions are strings less than 256 characters
+from the following set:  a-zA-Z0-9. _-:/()#,@[]+=&;{}!$*
+```
+
+The culprit: `` `ALB -> ${spec.name}` `` — the `>` character isn't in
+CloudFormation's allowed set for a security-group rule description.
+The SAME class of bug as Phase 3's em-dash finding (a different
+forbidden character, same underlying lesson: CloudFormation's string
+validation for these fields is stricter than it looks, and it's cheap
+to hit by accident with ordinary punctuation). Fixed by writing "ALB to
+`${spec.name}`" instead. `ServicesStack` (which owns the shared
+`internalSecurityGroup` these rules attach to) rolled back cleanly with
+zero impact to the 7 already-running Phase 5a/5b services — a real,
+practical benefit of CloudFormation's automatic rollback-on-failure
+behavior, not a hazard, when the failure is caught this early.
+
+### Bug 2, found live: the ENI-per-instance ceiling on `t4g.small`
+
+With the description fixed, the deploy proceeded — 3 of 8 app services
+placed and reached steady state, but 4 (order-service,
+fraud-detection-service, analytics-service, order-saga-orchestrator)
+sat permanently at `running: 0, pending: 0`, with a genuinely different
+placement failure than anything seen before:
+
+```
+(service order-service) was unable to place a task because no container instance met all of its requirements.
+The closest matching (container-instance ...) encountered error "RESOURCE:ENI".
+```
+
+`aws ec2 describe-instance-types --instance-types t4g.small` confirmed
+the real, hard constraint: `t4g.small` supports a MAXIMUM of 3 network
+interfaces — 1 is always the instance's own primary ENI, leaving only
+**2** free for `awsvpc`-mode ECS tasks, regardless of how much CPU or
+memory is still free on that instance. With 12 app-tier services (4
+backing + 8 app) and only 4 instances × 2 ENI-limited slots = 8 slots
+available, 4 services had nowhere to go — a capacity ceiling that has
+nothing to do with the memory-driven 2 → 4 growth Phase 5c started
+with.
+
+**ENI trunking, tried and found not to help here.** ECS's
+`awsvpcTrunking` account-level setting exists specifically to raise
+this per-instance ceiling via "branch" ENIs riding on one "trunk" ENI:
+
+```bash
+aws ecs put-account-setting-default --name awsvpcTrunking --value enabled
+```
+
+New instances launched after enabling it DID show the
+`ecs.capability.task-eni-trunking` attribute (confirmed via `aws ecs
+describe-container-instances`). Empirically, though, it made no
+difference: fresh instances still hit `RESOURCE:ENI` at exactly 2 tasks
+each, with CPU and memory both still plentiful (`remainingResources`
+showed 984+ MiB free). Left enabled anyway (harmless, account-wide,
+might matter for a different instance type later) but not relied on —
+the real fix was accepting the untrunked 2-tasks-per-instance ceiling
+as fact and sizing the pool around it: 6 app-tier instances × 2 = 12
+slots for the 12 services that needed one.
+
+### Bug 3, found live: a real, hard EC2 vCPU account quota
+
+Growing the pool to 7 (to comfortably fit 12 services with headroom)
+hit an entirely different wall — a genuine AWS account-level service
+quota, not anything this project's own code controlled:
+
+```
+You have requested more vCPU capacity than your current vCPU limit of 16 allows
+for the instance bucket that the specified instance type belongs to.
+```
+
+Confirmed directly: `aws service-quotas get-service-quota --service-code ec2
+--quota-code L-1216C47A` showed exactly 16 vCPU for "Running On-Demand
+Standard (A, C, D, H, I, M, R, T, Z) instances" — a quota bucket broad
+enough to cover essentially every general-purpose/compute/memory/
+burstable EC2 family, Graviton included, so switching instance types
+wasn't an escape hatch (confirmed `t4g.micro` is ALSO 2 vCPUs, not a
+smaller number — Graviton's burstable sizes don't reduce vCPU count the
+way they reduce memory). Empirically, 9 total `t4g.small` instances ran
+successfully but a 10th consistently failed — the real usable ceiling
+sits a bit above the naive `16 ÷ 2 = 8` math, but the boundary is real
+and reproducible. With 3 Kafka instances fixed, app-tier tops out at
+6 — which, conveniently, is exactly the 12 ENI-limited slots needed.
+
+The stuck update (stuck trying to reach 7 forever) was cancelled with
+`aws cloudformation cancel-update-stack` — the SAME "works cleanly on
+an in-progress UPDATE" technique already proven in Phase 3, still true
+here.
+
+### Bug 3b: a genuine deadlock between draining instances and the same quota
+
+Redeploying at the corrected count of 6 hit a subtler version of the
+same problem: 2 instances from the earlier over-provisioning attempt
+were stuck in `Terminating:Wait` (an ECS-managed lifecycle hook,
+draining their tasks before allowing termination), while every ACTIVE
+instance was already at its 2-task ENI ceiling — nowhere for the
+draining tasks to go. Meanwhile, the 2 terminating instances STILL
+counted against the account's vCPU quota, blocking their own
+replacements from launching. A real deadlock: nothing could progress
+without an outside nudge. `aws autoscaling complete-lifecycle-action
+--lifecycle-action-result CONTINUE` on the ECS-managed drain hook broke
+the cycle — forcing those 2 instances to finish terminating immediately
+(their 4 tasks got stopped, not gracefully drained — acceptable here
+since nothing important was uniquely running on them) freed the quota
+for real replacements to launch.
+
+### Bug 4, found live: the ALB does not strip the path it matched
+
+With capacity finally correct, all 12 services reached
+`running: 1`. The very first real test — an actual `curl` through the
+ALB — 404'd:
+
+```bash
+$ curl -s -i -X POST http://<alb-dns>/orders/api/orders -d '...'
+HTTP/1.1 404
+{"timestamp":"...","status":404,"error":"Not Found","path":"/orders/api/orders"}
+```
+
+That's Spring Boot's OWN 404 JSON body (not the ALB's fixed-response
+404), meaning the request DID reach `order-service` — it just didn't
+match anything, because `OrderController` is mapped at `/api/orders`,
+not `/orders/api/orders`. The real, easy-to-miss fact: **ALB path-based
+routing rules match a PATTERN to pick a target group; they do not strip
+that prefix before forwarding.** A request for `/orders/api/orders`
+arrives at the container as literally `/orders/api/orders`.
+
+Checking all 5 exposed services' controllers directly (not assumed)
+showed they ALL already follow the same `/api/<domain>/...` convention
+— `fraud-detection-service` at `/api/fraud/...`, `analytics-service` at
+`/api/analytics/...`, and so on. That consistency made the fix a single
+standard Spring Boot property, zero Java changes:
+`server.servlet.context-path`, set to match each service's ALB prefix
+(`/orders`, `/fraud`, `/analytics`, `/saga`, `/search`). It makes the
+APPLICATION itself respond at the prefix the ALB actually forwards,
+rather than trying (and failing, since ALB has no path-rewrite feature
+at all) to strip the prefix in front of the app.
+
+One easy-to-miss side effect: `server.servlet.context-path` moves
+**every** endpoint under that prefix, Actuator included — the ALB
+target group's own health check path had to move from
+`/actuator/health` to `/orders/actuator/health` (etc.) in the SAME
+change, or the fix for the app's routing would have broken its own
+health checks.
+
+### Recovery: a stalled `CREATE_IN_PROGRESS`, and the delete-and-recreate technique
+
+After redeploying the context-path fix, `cdk deploy
+OrderFlowAppServicesStack` immediately failed with `Stack ... is in
+CREATE_IN_PROGRESS state and can not be updated` — the STACK's
+original `CREATE`, from before the ENI/quota saga above, had never
+actually reached `CREATE_COMPLETE`. `aws cloudformation
+describe-stack-events` showed why: the last event was **nearly 3 hours
+old**, with zero further activity, even though the underlying ECS
+services were (by then) genuinely running fine. CloudFormation's own
+stabilization polling for this stack had stalled completely, not just
+slowly — a different failure mode from every "stuck but still
+progressing" case seen earlier in this project.
+
+Since the underlying issue (capacity/ENI/quota) was already fixed and
+the stack couldn't accept an UPDATE in this state, `aws cloudformation
+delete-stack` was the way out — and, unlike Phase 3's "only works if
+caught EARLY, before expensive resources exist" finding, this delete
+worked cleanly on a FULLY-built stack (78 resources, ECS services,
+ALB, target groups, all included) specifically because CloudFormation's
+DELETE path doesn't depend on whatever made the original CREATE's
+polling stall. The deletion itself was fast and genuinely progressing
+(fresh timestamps throughout, ECS services gone within ~2 minutes, ALB
+gone shortly after) — confirming the underlying resources were healthy
+all along; only CloudFormation's own bookkeeping for THIS stack had
+gotten stuck. A fresh `cdk deploy` from a clean slate, with every fix
+already baked into the CDK source from the start, completed cleanly in
+**268.69s** — a useful, honest contrast against the many hours the
+original, trouble-filled attempt took.
+
+### Verified live: a real order, placed through a public URL, completing the full choreography saga on AWS
+
+```bash
+$ curl -s -i -X POST http://OrderF-Alb16-ptcO3kocwRrO-1495158311.us-east-1.elb.amazonaws.com/orders/api/orders \
+    -H "Content-Type: application/json" \
+    -d '{"customerId":"cust-cloud-verify-1","region":"us-east","items":[{"productId":"sku-42","quantity":2}]}'
+HTTP/1.1 202
+{"orderId":"949337fd-b08b-4287-9e4e-28032fa78ae7","status":"ACCEPTED"}
+```
+
+202 Accepted, a real `orderId` — the request crossed the ALB, matched
+the `/orders/*` rule, landed at `order-service`'s
+`server.servlet.context-path`-corrected `/orders/api/orders` mapping,
+and was written into Postgres via the outbox pattern. But the REAL
+proof this phase exists for is what happened next, entirely
+asynchronously, visible only in `order-service`'s own logs — its
+`OrderStatusUpdater` (a Kafka consumer reacting to the saga's own
+events, publishing into the log-compacted `order-status` topic) shows
+the order transitioning through all 3 real downstream states, produced
+by 3 DIFFERENT services running on 3 different ECS tasks, in under one
+second:
+
+```
+2026-08-08T09:19:05.381Z  📝 order-status[949337fd-...] -> RESERVED
+2026-08-08T09:19:05.732Z  📝 order-status[949337fd-...] -> PAID
+2026-08-08T09:19:06.288Z  📝 order-status[949337fd-...] -> SHIPPED
+```
+
+`RESERVED` only happens if `inventory-service` genuinely consumed the
+`order-created` event, checked/reserved real stock in the shared
+Postgres database, and published `inventory-reserved`. `PAID` only
+happens if `payment-service` consumed THAT event and published
+`payment-completed`. `SHIPPED` only happens if `shipment-service`
+consumed THAT event and published `shipment-created`. This is the
+entire choreography saga — order-service, inventory-service,
+payment-service, shipment-service, all independently deployed, all
+talking only through the 3-broker Kafka cluster Phase 5a built —
+running correctly, end-to-end, on AWS, for the first time in this
+project's history.
+
+---
+
+## 🎓 Concepts learned in Phase 5c
+
+1. **A path-based ALB listener rule matches a pattern to pick a target
+   group — it does not rewrite or strip that prefix.** Whatever path
+   pattern matched is exactly what the backend receives; if the
+   backend's own routes don't already expect that prefix, the fix has
+   to happen on the APPLICATION side (a context path, a route alias),
+   not by expecting the load balancer to do it.
+2. **`awsvpc`-mode ECS tasks are capped by the underlying EC2 instance
+   TYPE's network interface limit, independent of CPU/memory
+   headroom.** A small instance can show plenty of free memory and
+   still refuse to place a task with `RESOURCE:ENI` — a genuinely
+   different failure mode from "insufficient memory," diagnosable only
+   by reading the actual placement-failure message rather than
+   assuming it's another capacity issue.
+3. **A feature "being available" (an attribute, a capability flag) is
+   not the same as it "changing observed behavior."** ENI trunking
+   showed up as an advertised container-instance capability without
+   empirically raising the actual task-placement ceiling — worth
+   verifying the OUTCOME (can more tasks actually place?), not just the
+   presence of the feature flag.
+4. **EC2 vCPU service quotas are shared across broad instance-family
+   buckets, not per instance type.** "Running On-Demand Standard (A, C,
+   D, H, I, M, R, T, Z) instances" covers nearly every
+   general-purpose/compute/memory/burstable family — switching
+   instance TYPES within that bucket doesn't dodge the quota; only a
+   fundamentally different category (GPU, FPGA) or an actual quota
+   increase request does.
+5. **A resource stuck "Terminating" can still count against capacity
+   limits that block its own replacement** — a real deadlock pattern
+   worth recognizing: if nothing is progressing and every party is
+   waiting on something else, look for a resource that's simultaneously
+   consuming a limited pool AND blocked from releasing it.
+6. **CloudFormation's own stabilization polling can stall completely,
+   independent of the underlying resources' actual health.** A stack
+   stuck `CREATE_IN_PROGRESS` for hours with zero new events, while the
+   real infrastructure underneath is fine, is a different failure mode
+   from "slow but still working" — recognizable by checking event
+   TIMESTAMPS, not just the current status string.
+7. **`delete-stack` can be a clean recovery path even on a FULLY-BUILT
+   stack**, not just an early, cheap `CREATE_IN_PROGRESS` — CloudFormation's
+   DELETE path is independent of whatever made a specific stack's
+   CREATE polling get stuck.
+
+## 🧠 Interview Q&A
+
+**Q: You configure an ALB listener rule to route `/api/v2/*` to a
+service. The service's own routes are defined WITHOUT that prefix
+(just `/users`, `/orders`, etc.). What happens, and how do you fix
+it?**
+A: Every request matching that rule arrives at the backend with the
+FULL original path still intact — `/api/v2/users`, not `/users` — since
+ALB has no path-rewriting capability; it only uses the path to DECIDE
+which target group gets the request. The backend will 404 on every
+request unless it's told to expect that prefix. The fix has to happen
+on the application side: either configure the app to serve everything
+under that prefix (a context path, e.g. Spring Boot's
+`server.servlet.context-path`, or an equivalent base-path setting in
+another framework), or design routes that already include the prefix
+from the start.
+
+**Q: An ECS task fails to place with `RESOURCE:ENI`, even though the
+target instance shows plenty of free CPU and memory. What's actually
+happening?**
+A: `awsvpc` network mode gives every task its own Elastic Network
+Interface, and EC2 instance TYPES have a hard maximum number of ENIs
+they can attach — a small instance might support only 2-3 total,
+leaving very few free for tasks after the instance's own primary ENI.
+This is a completely separate constraint from CPU/memory reservations;
+an instance can have gigabytes of free memory and still refuse a new
+task purely because it's out of network interfaces. The fix is either
+a larger instance type, more instances, or (where actually effective)
+ECS's ENI trunking feature — verified empirically, not just assumed to
+be working from the presence of a capability flag.
+
+**Q: How would you find out whether an ECS/EC2 capacity problem is
+really an account-level service quota rather than something in your
+own configuration?**
+A: Check the actual EC2/Auto Scaling API error message first — AWS
+service quota errors are usually explicit ("you have requested more
+vCPU capacity than your current limit of N allows"), not silent. Cross-
+reference with `aws service-quotas get-service-quota` for the specific
+quota code the error names. It's also worth knowing these quotas are
+often shared across broad instance-family "buckets" (e.g., one quota
+covering most general-purpose/compute/memory/burstable families
+together) — switching to a "different" instance type doesn't help if
+it's in the same bucket, which is a common trap when debugging this
+kind of failure.
+
+**Q: A CloudFormation stack has been `CREATE_IN_PROGRESS` for hours.
+How do you tell whether it's still making genuine progress or
+permanently stuck?**
+A: Check `describe-stack-events` and look at the TIMESTAMPS of the most
+recent events, not just the current status string — a stack that's
+still actively working shows a steady trickle of new events; one whose
+last event is hours old with nothing since is stalled, regardless of
+what the top-level status says. For a stuck CREATE that can't accept an
+UPDATE, `delete-stack` is a legitimate recovery path even on a
+fully-built stack with real resources already created — CloudFormation's
+delete path doesn't depend on whatever made the original create's
+polling get stuck, so a fresh create afterward often succeeds cleanly
+and quickly, especially once the root cause (in this case, capacity)
+has already been fixed in the underlying template.
 process's possibly-stale opinion.

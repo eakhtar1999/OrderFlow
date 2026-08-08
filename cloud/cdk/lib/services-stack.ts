@@ -29,7 +29,14 @@ const NAMESPACE_NAME = 'orderflow.local';
  */
 export class ServicesStack extends cdk.Stack {
   public readonly namespace: servicediscovery.PrivateDnsNamespace;
-  private readonly internalSecurityGroup: ec2.SecurityGroup;
+  // Public (not private, as originally scoped) as of Phase 5c —
+  // AppServicesStack's 8 Spring Boot services need this SAME shared
+  // security group (not a parallel duplicate) to reach Kafka/Postgres/
+  // Redis/Elasticsearch/Schema Registry, and the ALB needs to add its
+  // OWN ingress rules to it for the 5 externally-exposed services —
+  // one shared internal-traffic boundary is simpler to reason about
+  // than two overlapping ones.
+  public readonly internalSecurityGroup: ec2.SecurityGroup;
 
   constructor(scope: Construct, id: string, props: ServicesStackProps) {
     super(scope, id, props);
