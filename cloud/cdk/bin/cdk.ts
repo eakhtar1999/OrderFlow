@@ -4,6 +4,7 @@ import { BudgetStack } from '../lib/budget-stack';
 import { NetworkStack } from '../lib/network-stack';
 import { EcsClusterStack } from '../lib/ecs-cluster-stack';
 import { EcrStack } from '../lib/ecr-stack';
+import { ServicesStack } from '../lib/services-stack';
 
 const app = new cdk.App();
 
@@ -34,7 +35,7 @@ new BudgetStack(app, 'OrderFlowBudgetStack', { env });
 // EcsClusterStack, in that order, without needing to be told to.
 const network = new NetworkStack(app, 'OrderFlowNetworkStack', { env });
 
-new EcsClusterStack(app, 'OrderFlowEcsClusterStack', {
+const ecsCluster = new EcsClusterStack(app, 'OrderFlowEcsClusterStack', {
   env,
   vpc: network.vpc,
   ecsInstanceSecurityGroup: network.ecsInstanceSecurityGroup,
@@ -48,3 +49,15 @@ new EcsClusterStack(app, 'OrderFlowEcsClusterStack', {
 // way NetworkStack -> EcsClusterStack's real prop-passing dependency
 // requires it.
 new EcrStack(app, 'OrderFlowEcrStack', { env });
+
+// Phase 5a: the actual workloads. Depends on both NetworkStack (VPC)
+// and EcsClusterStack (the cluster + the two capacity providers) —
+// same cross-stack-reference mechanism as EcsClusterStack's own props
+// above, so `cdk deploy` again orders this correctly on its own.
+new ServicesStack(app, 'OrderFlowServicesStack', {
+  env,
+  vpc: network.vpc,
+  cluster: ecsCluster.cluster,
+  kafkaCapacityProviderName: ecsCluster.kafkaCapacityProviderName,
+  appCapacityProviderName: ecsCluster.appCapacityProviderName,
+});

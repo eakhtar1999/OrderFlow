@@ -1273,3 +1273,438 @@ default. A registry that counts every distinct manifest as an "image"
 push` commands you ran — the real signal is which digest actually
 carries the tag you expect (`latest`, a version number, etc.); that's
 the one anything will actually pull and run.
+
+---
+
+## Phase 5a: `ServicesStack` — 3 real Kafka brokers, a real KRaft quorum, Schema Registry
+
+This is the actual point of the entire cloud deployment. Every prior
+phase — the Dockerfiles, the CDK vocabulary, the budget guardrail, the
+two capacity pools, the ECR repos — existed to make THIS phase possible:
+3 genuinely independent Kafka brokers, each on its own EC2 instance,
+forming one real KRaft controller quorum. Nothing about `docs/
+system-design.md`'s "single broker, RF=1, no real failover" gap can be
+closed without this actually running.
+
+### The design: 3 `Ec2Service`s, not 1 service with 3 tasks
+
+A single `Ec2Service` with `desiredCount: 3` was the wrong shape for
+this, even though it's the more common ECS pattern. An `Ec2Service`
+treats its tasks as interchangeable replicas of the SAME thing — fine
+for 3 identical, stateless copies of an app server, wrong for 3 Kafka
+brokers that each need a DIFFERENT, STABLE identity
+(`KAFKA_NODE_ID=1/2/3`, a different Cloud Map DNS name, a different
+slice of persistent local disk). `ServicesStack` instead creates 3
+completely separate `Ec2Service` resources — `kafka-1`, `kafka-2`,
+`kafka-3` — each with `desiredCount: 1` and its own task definition,
+env vars, and Cloud Map registration. The one thing tying them together
+is `KAFKA_CONTROLLER_QUORUM_VOTERS`, computed once and handed
+identically to all 3:
+
+```typescript
+const controllerQuorumVoters = [1, 2, 3]
+  .map((nodeId) => `${nodeId}@kafka-${nodeId}.${NAMESPACE_NAME}:9093`)
+  .join(',');
+// "1@kafka-1.orderflow.local:9093,2@kafka-2.orderflow.local:9093,3@kafka-3.orderflow.local:9093"
+```
+
+Each broker's own `Ec2Service` also carries
+`placementConstraints: [ecs.PlacementConstraint.distinctInstances()]`
+— this is what turns "3 tasks that COULD land on the same EC2 instance"
+into "3 tasks GUARANTEED to land on 3 different instances," which is
+the entire reason `EcsClusterStack` built a separate, dedicated,
+exactly-3-instance Kafka capacity pool back in Phase 3. Without this
+constraint, ECS's default bin-packing behavior could easily put 2 or
+even all 3 brokers on the same physical instance — technically "3
+Kafka processes," but a single EC2 instance failure would then take
+down more than 1 broker at once, defeating the entire point of this
+deployment.
+
+### Cloud Map: how 3 tasks with dynamic IPs find each other by stable name
+
+ECS tasks in `awsvpc` network mode get a fresh ENI (and fresh private
+IP) every time they're placed or replaced — there's no way to hardcode
+`KAFKA_CONTROLLER_QUORUM_VOTERS` with real IP addresses that would
+survive a single task restart. AWS Cloud Map (`servicediscovery.
+PrivateDnsNamespace`) solves this the same way Kubernetes' internal DNS
+does: a private Route 53 hosted zone, scoped to the VPC, where
+`kafka-1.orderflow.local` always resolves to whatever IP `kafka-1`'s
+CURRENT task actually has, updated automatically as ECS starts/stops/
+replaces tasks. `ServicesStack` creates one namespace
+(`orderflow.local`) and each `Ec2Service` self-registers into it via
+`cloudMapOptions` — no separate DNS management, no hardcoded IPs
+anywhere in this stack.
+
+The namespace is created directly inside `ServicesStack`, not added to
+the already-deployed, already-merged `EcsClusterStack`'s cluster — a
+deliberate choice to avoid touching a stable prior phase's stack for a
+concern (service discovery for services that don't exist until THIS
+phase) that belongs entirely to the new one.
+
+### A real bug, caught before it ever touched AWS: `cdk synth` exposed a missing security group rule
+
+Before deploying anything, `cdk synth OrderFlowServicesStack` was run
+and the output inspected directly rather than assumed correct. It
+showed something easy to miss: every `Ec2Service` in `awsvpc` mode
+auto-creates its OWN security group by default, with an egress-only
+rule (`0.0.0.0/0`, allow all outbound) and **zero ingress rules**:
+
+```yaml
+kafka1ServiceSecurityGroup...:
+  Type: AWS::EC2::SecurityGroup
+  Properties:
+    GroupDescription: OrderFlowServicesStack/kafka-1Service/SecurityGroup
+    SecurityGroupEgress:
+      - CidrIp: 0.0.0.0/0
+        IpProtocol: "-1"
+    # no ingress rules at all
+```
+
+With 4 independently-created security groups like this (one per
+service), `kafka-1` would have had no rule allowing `kafka-2` or
+`kafka-3` to reach it on 9092/9093, and Schema Registry would have had
+no rule allowing it to reach ANY broker — a KRaft quorum that could
+never have formed, discoverable only after real EC2 instances were
+already running and billing. The fix: one SHARED security group,
+created explicitly, with a **self-referencing ingress rule** — anything
+already wearing this security group may talk to anything else wearing
+it, on exactly the ports these services need:
+
+```typescript
+this.internalSecurityGroup = new ec2.SecurityGroup(this, 'InternalSecurityGroup', {
+  vpc: props.vpc,
+  allowAllOutbound: true,
+});
+this.internalSecurityGroup.addIngressRule(this.internalSecurityGroup, ec2.Port.tcp(9092), '...');
+this.internalSecurityGroup.addIngressRule(this.internalSecurityGroup, ec2.Port.tcp(9093), '...');
+this.internalSecurityGroup.addIngressRule(this.internalSecurityGroup, ec2.Port.tcp(8085), '...');
+```
+
+...then passed explicitly to all 4 `Ec2Service`s via `securityGroups:
+[this.internalSecurityGroup]`, which stops CDK from auto-creating the
+broken per-service default. This is the same "Security Groups as the
+access-control boundary" approach `NetworkStack` already used for the
+ALB/instance split back in Phase 3, applied one level down for
+service-to-service traffic. Catching this at `cdk synth` time — a
+free, local, offline command — instead of after a live deploy is
+exactly why `synth`/`diff` are run before every `deploy` in this
+project, not a formality.
+
+### A real bug, found live: non-root container + root-owned bind mount = broker can't write its own metadata
+
+`cdk synth` catches wiring mistakes; it can't catch a bug that only
+exists once a real container runs against a real host filesystem. The
+first live deploy attempt had all 3 brokers crash-loop immediately:
+
+```
+===> User	uid=1000(appuser) gid=1000(appuser) groups=1000(appuser)
+Formatting /var/lib/kafka/data with metadata.version 3.8-IV0.
+Error while writing meta.properties file /var/lib/kafka/data: /var/lib/kafka/data/bootstrap.checkpoint.tmp
+```
+
+`apache/kafka:3.8.0` runs as a non-root user (`uid 1000`, `appuser`) —
+good, standard image-hardening practice. But each broker task's
+`Volume.host.sourcePath` (`/data/kafka` on the EC2 instance, bind-mounted
+into the container at `/var/lib/kafka/data`, matching the
+`KAFKA_LOG_DIRS` env var — the same fix Build Order Step 12 already
+needed for the LOCAL docker-compose deployment, now needed again here
+for the same underlying reason) gets auto-created by Docker on first
+mount, owned by `root:root`. `appuser` inside the container has no
+write permission to a root-owned host directory — the fix has to
+happen ON THE HOST, before the container ever starts. `AutoScalingGroup
+.addUserData()` appends shell commands to the Kafka pool's EC2 launch
+template, run once at instance boot:
+
+```typescript
+kafkaAsg.addUserData(
+  'mkdir -p /data/kafka',
+  'chown -R 1000:1000 /data/kafka',
+);
+```
+
+The subtlety that made this take longer to fully resolve than the code
+change itself: an `AutoScalingGroup`'s launch template change does
+**not** retroactively touch instances that are already running — it
+only affects instances launched AFTER the change (new capacity, or an
+instance the ASG replaces on its own). The 3 Kafka EC2 instances from
+the FIRST deploy attempt already existed with the OLD, unfixed
+UserData baked in. Redeploying `EcsClusterStack` alone was not enough;
+the 3 existing instances had to be terminated directly —
+
+```bash
+aws ec2 terminate-instances --instance-ids i-0c6ec3c0552fe99b2 i-05fa2bf9afdd93717 i-054102b896d1b3be5
+```
+
+— so the ASG would launch 3 FRESH replacements from the corrected
+launch template. This is the exact same trade-off `up.sh`'s own
+comments already documented for a different reason (bind-mounted Kafka
+data does not survive a `down.sh`/`up.sh` cycle) — here it was used
+deliberately, as the actual fix mechanism, not an accepted side effect.
+
+### A second real bug, found live: a stale ECS placement failure needed a manual nudge
+
+Once the permission fix was in place, `kafka-1`, `kafka-3`, and
+`schema-registry` all reached steady state — but `kafka-2` stayed at
+`running: 0, desired: 1, pending: 0`, with its most recent event being
+an old placement failure:
+
+```
+(service kafka-2) was unable to place a task because no container
+instance met all of its requirements. The closest matching
+(container-instance 8b7d...) has insufficient memory available.
+```
+
+This happened because `kafka-2`'s task tried to place WHILE the 3
+replacement Kafka instances were still mid-registration — an entirely
+transient condition (the 3rd instance simply wasn't in the cluster
+yet). By the time all 3 instances were fully registered, one of them
+sat completely idle with all 1846 MiB of reservable memory free — but
+`kafka-2`'s service wasn't automatically retrying. `aws ecs
+update-service --force-new-deployment` triggered an immediate new
+placement attempt rather than waiting out ECS's own backoff:
+
+```bash
+aws ecs update-service --cluster orderflow-cluster --service kafka-2 --force-new-deployment
+```
+
+...after which `kafka-2` placed cleanly onto the empty instance and
+joined the quorum.
+
+### Verified live: a real 3-broker KRaft quorum, not 3 independent single-node brokers
+
+This is the actual payoff. Broker 1's own CloudWatch logs show a real
+Raft leader election, with `voters=[1, 2, 3]` — all 3 REAL broker node
+IDs, running on 3 REAL, physically separate EC2 instances:
+
+```
+[RaftManager id=1] Completed transition to FollowerState(..., epoch=120,
+  leader=kafka-3.orderflow.local:9093 (id: 3 ...), voters=[1, 2, 3], ...)
+[RaftManager id=1] Completed transition to CandidateState(..., epoch=142,
+  voteStates={1=GRANTED, 2=GRANTED, 3=UNRECORDED}, ...)
+[RaftManager id=1] Completed transition to Leader(..., epoch=142, ...)
+[KafkaRaftServer nodeId=1] Kafka Server started
+```
+
+Cross-checking the OTHER 2 brokers' independent logs confirms they
+agree with broker 1's view — a real, consistent, distributed
+election, not one broker's isolated opinion:
+
+```
+# kafka-2's own log:
+[RaftManager id=2] Completed transition to Voted(epoch=142, votedKey=ReplicaKey(id=1, ...), ...)
+[RaftManager id=2] Completed transition to FollowerState(..., epoch=142,
+  leader=kafka-1.orderflow.local:9093 (id: 1 ...), voters=[1, 2, 3], ...)
+
+# kafka-3's own log:
+[RaftManager id=3] Completed transition to FollowerState(..., epoch=142,
+  leader=kafka-1.orderflow.local:9093 (id: 1 ...), voters=[1, 2, 3], ...)
+```
+
+All 3 agree: epoch 142, broker 1 is leader. And this isn't just
+controller-quorum bookkeeping — the internal `__consumer_offsets` topic
+(auto-created despite `KAFKA_AUTO_CREATE_TOPICS_ENABLE=false`, since
+internal topics are a special case) shows real partition leadership
+SPREAD ACROSS different brokers, visible in broker 1's own
+`ReplicaFetcher` logs pulling from `leaderId=2` for some partitions and
+`leaderId=3` for others — genuine multi-broker data replication, not
+just 3 processes agreeing to elect one of themselves:
+
+```
+[ReplicaFetcher replicaId=1, leaderId=2, fetcherId=0] ... partition __consumer_offsets-8 ...
+[ReplicaFetcher replicaId=1, leaderId=3, fetcherId=0] ... partition __consumer_offsets-16 ...
+```
+
+Schema Registry's own logs confirm it isn't just listening on port
+8085 in isolation — it actually joined a Kafka consumer group backed
+by this 3-broker cluster, elected itself leader (the only replica, so
+trivially so), and read/caught up on its internal `_schemas` topic
+before serving its first HTTP request:
+
+```
+[Schema registry clientId=sr-1, groupId=schema-registry] Successfully joined group ...
+Finished rebalance with leader election result: ... isLeader=true
+Wait to catch up until the offset at 2
+Reached offset at 2
+Server started, listening for requests... (io.confluent.kafka.schemaregistry.rest.SchemaRegistryMain)
+```
+
+Final state, confirmed directly against the live AWS API rather than
+inferred from CDK's own "it deployed" signal:
+
+```bash
+$ aws ecs describe-services --cluster orderflow-cluster --services kafka-1 kafka-2 kafka-3 schema-registry \
+    --query 'services[].{name:serviceName,running:runningCount,desired:desiredCount,pending:pendingCount}' --output table
++---------+-------------------+----------+-----------+
+| desired |       name        | pending  |  running  |
++---------+-------------------+----------+-----------+
+|  1      |  kafka-1          |  0       |  1        |
+|  1      |  kafka-2          |  0       |  1        |
+|  1      |  kafka-3          |  0       |  1        |
+|  1      |  schema-registry  |  0       |  1        |
++---------+-------------------+----------+-----------+
+
+$ aws cloudformation describe-stacks --stack-name OrderFlowServicesStack --query 'Stacks[0].StackStatus'
+"CREATE_COMPLETE"
+```
+
+### `up.sh` / `down.sh`: updated for the new stack dependency
+
+`ServicesStack`'s 4 ECS services reference `EcsClusterStack`'s cluster
+and capacity providers via CloudFormation `Fn::ImportValue` — AWS
+refuses to delete a stack whose exports are still imported elsewhere.
+`down.sh` now destroys `OrderFlowServicesStack` FIRST, releasing those
+imports, before attempting `OrderFlowEcsClusterStack`; `up.sh` deploys
+`ServicesStack` as a separate, LATER `cdk deploy` call (not bundled
+into the same multi-stack command as `NetworkStack`/`EcsClusterStack`)
+so the EC2 instances have time to register with the cluster before ECS
+tries to place any broker task onto them.
+
+### Real deployment timing, and why the honest number here is inflated
+
+```
+OrderFlowEcsClusterStack: 206.36s
+OrderFlowServicesStack:  1983.68s   (~33 minutes)
+```
+
+The `ServicesStack` number is NOT a clean baseline — it includes the
+real, live debugging time for both bugs above (waiting out the first
+crash-loop, terminating and waiting for 3 replacement EC2 instances to
+boot and register, waiting out `kafka-2`'s stale placement backoff).
+Recorded honestly rather than replaced with a cleaner re-run, since the
+whole point of this document is what actually happened, including the
+detours — a clean redeploy with both fixes already in the CDK source
+(the normal case after this phase merges) would be close to
+`EcsClusterStack`'s own instance-boot-bound ~3-4 minutes, plus however
+long the 4 ECS services take to reach steady state once real capacity
+exists (observed here at under a minute once instances were actually
+ready).
+
+### ECS Exec: set up, not yet exercised
+
+Every service in this phase has `enableExecuteCommand: true` — the
+modern, SSH-free way to get an interactive shell inside a running
+container for debugging (`aws ecs execute-command`), consistent with
+this project's Security Groups containing no SSH ingress rule anywhere.
+Actually running it locally requires the separate `session-manager-
+plugin` binary, which needs an interactive `sudo` install this session
+couldn't complete non-interactively — deferred, not blocking, since
+CloudWatch Logs already provided everything needed to verify the
+quorum above. Worth finishing before the live broker-kill/failover demo
+in a later phase, where an interactive shell inside a SURVIVING broker
+(to run `kafka-topics.sh`/`kafka-metadata-quorum.sh` by hand, live,
+while the failure is happening) will matter more than log excerpts
+after the fact.
+
+---
+
+## 🎓 Concepts learned in Phase 5a
+
+1. **One `Ec2Service` per broker, not one `Ec2Service` with N tasks** —
+   the right shape whenever "identical, interchangeable replicas" isn't
+   true of the thing being deployed. Each Kafka broker needs a
+   different, STABLE identity; ECS's normal service model assumes
+   tasks are fungible.
+2. **`PlacementConstraint.distinctInstances()`** is what actually
+   guarantees per-instance failure isolation — without it, "3 tasks" and
+   "3 tasks on 3 different machines" are NOT the same guarantee, even
+   with a dedicated capacity pool sized exactly 3.
+3. **Cloud Map (`PrivateDnsNamespace`) solves the "IP changes every
+   restart" problem for peer-to-peer clustered systems on ECS** — the
+   same fundamental problem Kubernetes' internal DNS solves, applied to
+   ECS's `awsvpc` mode.
+4. **`cdk synth` is a real bug-finding tool, not just a formality
+   before `deploy`** — the missing-ingress-rule bug here was caught
+   completely offline, before a single EC2 instance existed, simply by
+   reading the generated CloudFormation template.
+5. **A non-root container image + a host bind mount is a real,
+   recurring class of bug**, not specific to Kafka — any time a
+   container's process runs as a non-root user AND writes to a
+   host-mounted path, the host-side ownership of that path (which
+   Docker does NOT automatically match to the container's user) has to
+   be arranged explicitly, usually via instance bootstrap tooling
+   (`UserData` here; a Kubernetes `initContainer` or `fsGroup` in that
+   world).
+6. **Changing an Auto Scaling Group's launch template does not affect
+   already-running instances** — only NEW ones. Fixing a bug baked into
+   an instance's boot-time configuration requires actually replacing
+   the instance, not just updating the template it was originally
+   launched from.
+7. **ECS service placement failures can be transient and stale** — a
+   service can be stuck on an old failure event with nothing actively
+   retrying, even once the underlying condition (insufficient capacity)
+   has resolved. `--force-new-deployment` is the direct way to trigger
+   an immediate retry rather than waiting out whatever backoff ECS is
+   currently on.
+8. **"The stack deployed successfully" and "the distributed system
+   actually formed a working quorum" are two different claims** —
+   CloudFormation's `CREATE_COMPLETE` only means the ECS service
+   scheduler reported steady state (the right number of tasks running).
+   Confirming the KRaft election actually happened, and that all 3
+   brokers agree on the same leader/epoch, required reading the
+   application's own logs directly.
+
+## 🧠 Interview Q&A
+
+**Q: You need to deploy a 3-node clustered system (Kafka, etcd,
+ZooKeeper, Cassandra — anything where each node needs a distinct,
+stable identity) on ECS. Would you use one service with `desiredCount:
+3`, or something else?**
+A: Something else — N separate services, one per node, each with
+`desiredCount: 1`. A single ECS service models its tasks as
+interchangeable replicas of the same thing, which is exactly wrong for
+a cluster where each member needs a different node ID, a different
+stable network identity, and often its own slice of persistent storage.
+Separate services also make it possible to give each member its own
+placement constraint, so failure isolation (one member per physical
+host) can actually be guaranteed rather than left to chance.
+
+**Q: How do you guarantee 3 ECS tasks land on 3 DIFFERENT EC2
+instances, not just "3 tasks somewhere in the cluster"?**
+A: `PlacementConstraint.distinctInstances()` on each service (or task
+placement, depending on API surface) — without it, ECS's default
+scheduler behavior (spread or binpack, depending on configured
+placement strategy) is a preference, not a guarantee, and multiple
+tasks CAN end up on the same host. A dedicated capacity pool sized to
+match (exactly 3 instances for exactly 3 constrained tasks here) makes
+the constraint satisfiable; the constraint itself is what actually
+enforces the isolation.
+
+**Q: A container process running as a non-root user can't write to a
+directory you bind-mounted from the host. What's actually happening,
+and how do you fix it?**
+A: Docker bind mounts preserve the HOST-side ownership of the mounted
+path — if Docker creates that path fresh on first mount (common when
+nothing pre-creates it), it's owned by `root:root` on the host, and a
+container process running as a non-root UID has no write permission to
+it, regardless of what the container's own filesystem permissions look
+like. The fix has to happen on the host side, before the container
+starts: pre-create the directory and `chown` it to match the
+container's UID (found via the image's own startup logs, or its
+Dockerfile/documentation) — via instance bootstrap tooling (cloud-init/
+UserData on EC2, an `initContainer` or `fsGroup` setting in Kubernetes),
+not inside the container itself.
+
+**Q: You updated an Auto Scaling Group's launch template to fix a
+boot-time configuration bug. The bug is still happening. Why?**
+A: A launch template change only affects instances launched AFTER the
+change — it does not retroactively reconfigure instances that are
+already running, since EC2 instances don't re-execute their boot-time
+UserData on their own. The already-running instances need to actually
+be replaced — either by terminating them directly (letting the ASG
+launch replacements from the now-current template) or via a proper
+EC2 instance refresh, if the ASG is configured for one.
+
+**Q: How do you actually verify a Raft-based quorum (KRaft, etcd,
+anything Raft-family) formed correctly, beyond "the process is
+running"?**
+A: Check for agreement across INDEPENDENT nodes' own logs/state, not
+just one node's self-report. A real, healthy quorum shows: the same
+epoch/term number reported by every member, the same leader identity
+agreed on by every member, and — for systems with actual data
+replication on top of the consensus layer (Kafka's partition leadership
+being a clear example) — data/partition leadership genuinely
+distributed across different nodes, not concentrated on the one you
+happened to check. A single node reporting "I am the leader" is
+necessary but not sufficient; the other members corroborating it is
+what makes it a real, cluster-wide verified fact rather than one
+process's possibly-stale opinion.
