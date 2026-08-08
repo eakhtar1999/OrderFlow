@@ -92,6 +92,22 @@ export class EcsClusterStack extends cdk.Stack {
       maxCapacity: 3,
       desiredCapacity: 3,
     });
+    // Found live in Phase 5a: apache/kafka:3.8.0 runs as a non-root
+    // user (uid 1000, "appuser") for real image-hardening reasons —
+    // good practice in general. But ServicesStack's Kafka broker task
+    // definitions bind-mount an EC2 HOST path (/data/kafka) into that
+    // container for durable local storage, and a host path Docker
+    // creates on first mount is owned by root:root by default. Result:
+    // appuser couldn't write meta.properties into it and every broker
+    // task crash-looped on "Error while writing meta.properties file."
+    // The fix has to happen on the HOST, before any container starts
+    // — `addUserData` appends shell commands to this ASG's launch
+    // template, run once at instance boot, right alongside the
+    // ECS-agent bootstrap CDK already injects here automatically.
+    kafkaAsg.addUserData(
+      'mkdir -p /data/kafka',
+      'chown -R 1000:1000 /data/kafka',
+    );
     const kafkaCapacityProvider = new ecs.AsgCapacityProvider(this, 'KafkaCapacityProvider', {
       autoScalingGroup: kafkaAsg,
       capacityProviderName: 'orderflow-kafka-capacity',
