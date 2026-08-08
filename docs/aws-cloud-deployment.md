@@ -2338,4 +2338,273 @@ delete path doesn't depend on whatever made the original create's
 polling get stuck, so a fresh create afterward often succeeds cleanly
 and quickly, especially once the root cause (in this case, capacity)
 has already been fixed in the underlying template.
+
+---
+
+## Phase 6: killing a Kafka broker for real — the actual payoff of this entire deployment
+
+Every phase before this one existed to make this moment possible.
+`docs/system-design.md`'s own "Known gaps" section named it plainly:
+*"ISR / leader election / broker-failure simulation is not
+demonstrated... needs a 3-broker cluster."* Phase 5a built that
+cluster. This phase kills one of its 3 brokers — for real, by
+terminating the underlying EC2 instance, not by stopping a container
+gracefully — and captures exactly what happens next, including the
+parts that didn't go smoothly. Left in this document deliberately: the
+messy parts are more honest, and more useful, than a demo edited down
+to only the clean parts.
+
+### The setup: kill the CURRENT LEADER, not just any broker
+
+Before touching anything, the current KRaft controller leader was
+identified directly from each broker's own logs — `kafka-1`, epoch
+142, agreed by all 3 brokers. Killing a FOLLOWER would only prove
+"a replica can disappear painlessly"; killing the LEADER forces an
+actual, real election, the more convincing and more honest test:
+
+```bash
+$ aws ec2 terminate-instances --instance-ids i-0a4a69013fa84ef9f   # kafka-1's EC2 instance
+```
+
+A test order was placed through the ALB seconds later, DURING the
+outage window, specifically to observe what a real client experiences
+while a broker is actively dying — not before or after, but during.
+
+### Verified live: server-side Raft recovery in 6 seconds
+
+Both surviving brokers' own independent logs, cross-checked against
+each other (not just trusting one broker's self-report):
+
+```
+# kafka-2's own log:
+[09:27:09,581] Completed transition to CandidateState(localId=2, epoch=143, ...) from FollowerState(..., epoch=142, leader=kafka-1...)
+[09:27:09,597] Completed transition to Leader(localId=2, epoch=143, ...)
+
+# kafka-3's own log, same moment, independently:
+[09:27:09,591] Completed transition to Unattached(epoch=143, ...) from FollowerState(..., epoch=142, leader=kafka-1...)
+[09:27:09,596] Completed transition to Voted(epoch=143, votedKey=ReplicaKey(id=2, ...), ...)
+[09:27:09,612] Completed transition to FollowerState(..., epoch=143, leader=kafka-2.orderflow.local:9093, ...)
+```
+
+Both survivors independently detected `kafka-1`'s disappearance,
+elected `kafka-2`, and agree on the exact same epoch and leader — a
+genuine, cross-verified Raft election recovering from a real node
+failure in **6 seconds**. This is the architectural claim Phase 5a made
+and this phase proves: the 3-broker design genuinely tolerates losing
+1 node.
+
+### A real, honest finding: server recovery ≠ client recovery
+
+The test order placed during the outage got a `202 Accepted` from
+`order-service`'s REST layer immediately — but its actual Kafka
+publish, inside `OutboxRelay`'s transactional producer, started
+repeatedly failing:
+
+```
+2026-08-08T09:28:14Z ERROR ... Failed to publish outbox row id=2 orderId=767a7707-...: Timeout expired after 60000ms while awaiting EndTxn(true)
+2026-08-08T09:29:14Z ERROR ... Failed to publish outbox row id=2 orderId=767a7707-...: Timeout expired after 60000ms while awaiting EndTxn(true)
+```
+
+The reason: this specific producer's transaction COORDINATOR had been
+assigned to `kafka-1` before it died. Kafka's transactional producers
+pin to a specific coordinator broker at initialization; that pinning
+doesn't automatically follow a Raft election the way the underlying
+metadata/replication layer does — the client has to notice the
+coordinator is gone and re-discover a new one, which costs a full
+`transaction.timeout.ms` (60s here) per stuck attempt, not 6 seconds.
+Separately, `order-service`'s own status-update CONSUMER kept trying to
+reach "node 1" and got `DisconnectException` for a while too — a
+second, related symptom of the same underlying fact: CLIENT-side
+connection/metadata caches don't refresh instantly just because the
+SERVER-side cluster already recovered. This is a genuinely important,
+easy-to-miss distinction: "the cluster is healthy again" and "every
+client has noticed" are different claims, on different timescales.
+
+### The replacement instance's own recovery hit real, compounding operational problems
+
+Getting `kafka-1` itself back — not just electing around its absence —
+took far longer than 6 seconds, for reasons that had NOTHING to do with
+Kafka or Raft:
+
+1. **The same stuck lifecycle-hook deadlock from Phase 5c, again.** The
+   dead instance sat in `Terminating:Wait`, still consuming the
+   account's EC2 quota, blocking its own replacement — required the
+   same `aws autoscaling complete-lifecycle-action --lifecycle-action-result
+   CONTINUE` fix already documented in Phase 5c.
+2. **The exact same 16 vCPU account quota from Phase 5c**, now blocking
+   KAFKA's OWN replacement instance instead of an app-tier one. Between
+   09:27 and 10:04 — **37 minutes** — repeated launch attempts failed,
+   oscillating between the vCPU quota error and one transient
+   "instance type not supported in this Availability Zone" error.
+3. **Breaking through required trading one outage for a smaller one.**
+   To free a vCPU slot, the app-tier pool was temporarily shrunk from
+   6 to 5 instances — a user-authorized, deliberately disruptive
+   action (blocked once, correctly, by this environment's own
+   auto-mode safety classifier, since it stops 2 currently-running
+   services; proceeded only after explicit confirmation). This ITSELF
+   triggered 2 more stuck `Terminating:Wait` deadlocks on the app-tier
+   side, each needing the same forced-completion fix.
+
+`kafka-1`'s replacement instance finally launched at **10:04:01** — 37
+minutes after the kill. The new broker (a genuinely fresh node, new
+directory ID, nothing carried over from the dead one) rejoined the
+SAME epoch-143 quorum as a follower of `kafka-2`, confirmed in its own
+logs:
+
+```
+[10:05:23,859] Completed transition to FollowerState(..., epoch=143, leader=kafka-2.orderflow.local:9093, ...)
+[10:05:25,481] Kafka Server started (kafka.server.KafkaRaftServer)
+```
+
+Full 3-broker health restored. The stuck test order's outbox row
+finally published successfully 4 seconds after one last timeout:
+
+```
+2026-08-08T10:05:38Z ERROR ... Timeout expired after 60000ms while awaiting EndTxn(true)
+2026-08-08T10:05:42Z  INFO ... 📤 Relayed outbox row id=2 -> order-created + order-status for orderId=767a7707-...
+```
+
+**Total elapsed time for this one stuck message to get through: ~38.5
+minutes** — almost all of it capacity/quota churn, essentially none of
+it Kafka itself (which, again, recovered in 6 seconds).
+
+### The fix broke something else: a real "one outage causes another" moment
+
+The temporary app-tier shrink (6 → 5 instances) had its own delayed
+side effect. 5 instances × 2 ENI-limited task slots = 10 slots for 12
+app-tier services — 2 services (`inventory-service` and
+`elasticsearch`) got bumped and had nowhere to reschedule. This
+directly blocked the STUCK ORDER's actual saga completion even after
+its Kafka message got through: the message existed, but
+`inventory-service` — the thing that actually reserves stock and
+advances the saga — wasn't running to consume it.
+
+### A real CloudFormation lesson, found live: `cdk deploy` reporting "no changes" does not correct drift
+
+Restoring app-tier back to 6 via `cdk deploy OrderFlowEcsClusterStack`
+reported `(no changes)` and deployed in 24 seconds — but the ASG's
+actual live `desiredCapacity` stayed at 5. The reason: `desiredCapacity`
+had been changed OUTSIDE of CloudFormation, via a direct `aws
+autoscaling update-auto-scaling-group` call (the mechanism used to free
+the vCPU slot above). CloudFormation's diffing compares the TEMPLATE
+against its own last-applied state, not against the live resource's
+actual current value — since the template genuinely hadn't changed
+since the last real deploy, CloudFormation found nothing to do and
+never re-asserted the property, even though the live resource had
+drifted underneath it. This is a distinct, real lesson from anything
+found earlier in this project: infrastructure-as-code only overwrites
+drift when the CODE itself changes, not automatically on every deploy.
+The direct fix — another `aws autoscaling update-auto-scaling-group`
+call — corrected it immediately, but the CODE-level desired state
+(`minCapacity/maxCapacity/desiredCapacity: 6` in `ecs-cluster-stack.ts`)
+was never wrong; only the LIVE resource had silently diverged from it.
+
+### Honest final state, as of writing this section
+
+- **Kafka: fully proven, fully healthy.** All 3 brokers running,
+  cross-verified quorum, genuine failover demonstrated end-to-end. This
+  was the actual goal of this phase, and it is unambiguously achieved.
+- **App-tier: partially recovered, genuinely still open.** The 6th
+  app-tier instance has been retrying against the SAME 16 vCPU quota
+  for over 50 minutes without resolving — noticeably longer than the
+  two earlier times this exact quota wall cleared on its own (a few
+  minutes in Phase 5c, 37 minutes for Kafka's own replacement above).
+  `inventory-service` and `elasticsearch` remain down; the other 10 of
+  12 app-tier services are healthy. This is being left as an honestly
+  unresolved open item rather than papered over — a real illustration
+  of running a real workload right at a tight account quota's edge with
+  zero slack for even one unplanned replacement, let alone two
+  overlapping ones.
+
+---
+
+## 🎓 Concepts learned in Phase 6
+
+1. **Killing the current LEADER, not an arbitrary follower, is the
+   more convincing failure test** — it's the only way to actually
+   observe a real election happening, not just a replica's quiet
+   disappearance.
+2. **Cross-checking independent nodes' own logs, not just one node's
+   self-report, is what makes a distributed-system claim verified
+   rather than assumed** — this project's whole KRaft verification
+   methodology (Phase 5a and here) leans on this deliberately.
+3. **Server-side consensus recovery and client-side recovery happen on
+   genuinely different timescales.** A Raft election can complete in
+   single-digit seconds while a specific client (a pinned transaction
+   coordinator, a stale connection) takes tens of seconds to tens of
+   minutes to notice and recover — "the cluster is healthy" and "every
+   caller has noticed" are different, separately-verifiable claims.
+4. **Kafka transactional producers pin to a specific coordinator
+   broker** — if that broker dies mid-transaction, the client doesn't
+   instantly fail over; it times out (`transaction.timeout.ms`) before
+   retrying against a newly-discovered coordinator. A real, concrete
+   cost of exactly-once semantics under a real broker failure, not
+   just a config knob.
+5. **A capacity fix applied under pressure can create a second,
+   smaller outage** — freeing quota by shrinking one pool to grow
+   another is a real, sometimes-necessary trade-off, but it has
+   consequences that need tracking down separately, not assumed away
+   once the ORIGINAL problem is fixed.
+6. **Infrastructure-as-code does not self-heal drift on every deploy —
+   only when the CODE changes.** A live resource manually changed
+   outside the IaC tool can silently persist through a `(no changes)`
+   deploy, even though the tool's own template has always said
+   something different. Detecting this requires checking the LIVE
+   resource state directly, not trusting a clean `cdk deploy` output as
+   proof the live infrastructure matches the code.
+7. **An honestly-reported "still not fully resolved" is more valuable
+   than a quietly-omitted one.** The core architectural claim (Kafka
+   survives a broker failure) is fully proven; a separate, genuinely
+   still-open operational issue (account quota exhaustion under
+   compounding capacity pressure) is reported as such, not hidden
+   behind a "everything's fine now" summary.
+
+## 🧠 Interview Q&A
+
+**Q: You want to demonstrate that your Kafka cluster tolerates a
+broker failure. Would you kill a random broker, or does it matter
+which one?**
+A: It matters — killing the current controller/partition leader is the
+more rigorous test, because it forces an actual leader election to
+happen, observable and verifiable in the surviving brokers' own logs.
+Killing an arbitrary follower only proves a replica can disappear
+without the cluster crashing, which is a weaker claim than "the cluster
+correctly elects a new leader and continues serving requests."
+
+**Q: After a Kafka broker dies and a new leader is elected within
+seconds, a client-side operation (a transaction, a consumer) is still
+failing for several minutes. Is your failover broken?**
+A: Not necessarily — broker-side Raft/ISR recovery and client-side
+recovery are genuinely different processes on different timescales.
+Kafka clients cache connections, broker metadata, and (for
+transactional producers) a specific coordinator assignment; none of
+that is guaranteed to refresh instantly just because the underlying
+cluster already recovered. The right question isn't "why hasn't this
+client recovered yet" in isolation — it's whether the client eventually
+recovers within its own configured timeouts (here, `transaction.timeout.ms`),
+which is a real, tunable trade-off, not a bug.
+
+**Q: You fixed a capacity problem by shrinking one resource pool to
+free room for another. What's the risk in that approach?**
+A: The freed-up pool may not have had slack to spare — shrinking it
+can bump whatever was already running there, creating a SECOND,
+smaller-scope outage while fixing the first. The fix isn't "don't do
+this" (sometimes it's the only lever available under a hard external
+constraint like an account quota); it's to explicitly check what got
+displaced afterward, rather than assuming the original problem being
+fixed means everything is fine again.
+
+**Q: You changed a live AWS resource's setting directly via the AWS
+CLI, then ran your IaC tool's deploy command expecting it to restore
+the "correct" value from your code. It reported no changes and did
+nothing. Why?**
+A: Most IaC tools (CloudFormation included) diff the TEMPLATE against
+their own LAST-APPLIED state, not against the resource's actual live
+value in the cloud. If the template hasn't changed since the last real
+deploy, the tool has nothing new to apply and won't re-touch a resource
+just because it might have drifted underneath it. Detecting this kind
+of drift needs either an explicit drift-detection feature (CloudFormation
+has one) or checking the live resource directly — a clean, "no
+changes" deploy is not proof the live infrastructure still matches the
+code.
 process's possibly-stale opinion.
