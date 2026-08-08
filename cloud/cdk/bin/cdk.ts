@@ -5,6 +5,7 @@ import { NetworkStack } from '../lib/network-stack';
 import { EcsClusterStack } from '../lib/ecs-cluster-stack';
 import { EcrStack } from '../lib/ecr-stack';
 import { ServicesStack } from '../lib/services-stack';
+import { AppServicesStack } from '../lib/app-services-stack';
 
 const app = new cdk.App();
 
@@ -48,16 +49,34 @@ const ecsCluster = new EcsClusterStack(app, 'OrderFlowEcsClusterStack', {
 // nothing forces sequencing) — no explicit ordering needed here the
 // way NetworkStack -> EcsClusterStack's real prop-passing dependency
 // requires it.
-new EcrStack(app, 'OrderFlowEcrStack', { env });
+const ecrStack = new EcrStack(app, 'OrderFlowEcrStack', { env });
 
-// Phase 5a: the actual workloads. Depends on both NetworkStack (VPC)
-// and EcsClusterStack (the cluster + the two capacity providers) —
-// same cross-stack-reference mechanism as EcsClusterStack's own props
-// above, so `cdk deploy` again orders this correctly on its own.
-new ServicesStack(app, 'OrderFlowServicesStack', {
+// Phase 5a/5b: the backing infrastructure — Kafka brokers, Schema
+// Registry, Postgres, Redis, Elasticsearch. Depends on both
+// NetworkStack (VPC) and EcsClusterStack (the cluster + the two
+// capacity providers) — same cross-stack-reference mechanism as
+// EcsClusterStack's own props above, so `cdk deploy` again orders this
+// correctly on its own.
+const servicesStack = new ServicesStack(app, 'OrderFlowServicesStack', {
   env,
   vpc: network.vpc,
   cluster: ecsCluster.cluster,
   kafkaCapacityProviderName: ecsCluster.kafkaCapacityProviderName,
   appCapacityProviderName: ecsCluster.appCapacityProviderName,
+});
+
+// Phase 5c: the 8 Spring Boot services + the public ALB. Depends on
+// EcrStack (the images to actually run) and ServicesStack (the shared
+// internal security group and Cloud Map namespace every backing
+// dependency above already registered into) in addition to
+// NetworkStack/EcsClusterStack.
+new AppServicesStack(app, 'OrderFlowAppServicesStack', {
+  env,
+  vpc: network.vpc,
+  cluster: ecsCluster.cluster,
+  appCapacityProviderName: ecsCluster.appCapacityProviderName,
+  albSecurityGroup: network.albSecurityGroup,
+  internalSecurityGroup: servicesStack.internalSecurityGroup,
+  namespace: servicesStack.namespace,
+  repositories: ecrStack.repositories,
 });
