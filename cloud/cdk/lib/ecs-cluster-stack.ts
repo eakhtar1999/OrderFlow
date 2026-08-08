@@ -159,6 +159,20 @@ export class EcsClusterStack extends cdk.Stack {
       maxCapacity: 2,
       desiredCapacity: 2,
     });
+    // Phase 5b: same root-owned-bind-mount problem as Kafka's own fix
+    // above, pre-empted here instead of found live a second time.
+    // `postgres:16` and `redis:7` both run their entrypoint AS root
+    // (confirmed via `docker inspect --format '{{.Config.User}}'` —
+    // empty output means no USER directive) and internally chown their
+    // own data directory before dropping privileges, so THEY need no
+    // host-side fix. `elasticsearch:8.15.0` is the opposite: its image
+    // has an explicit `USER 1000:0` Dockerfile directive, so it never
+    // runs as root at all — same category of bug as apache/kafka's,
+    // pre-empted the same way.
+    appAsg.addUserData(
+      'mkdir -p /data/elasticsearch',
+      'chown -R 1000:0 /data/elasticsearch',
+    );
     const appCapacityProvider = new ecs.AsgCapacityProvider(this, 'AppCapacityProvider', {
       autoScalingGroup: appAsg,
       capacityProviderName: 'orderflow-app-capacity',

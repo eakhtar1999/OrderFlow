@@ -1708,3 +1708,254 @@ happened to check. A single node reporting "I am the leader" is
 necessary but not sufficient; the other members corroborating it is
 what makes it a real, cluster-wide verified fact rather than one
 process's possibly-stale opinion.
+
+---
+
+## Phase 5b: Postgres, Redis, Elasticsearch — the 3 stateful dependencies the app tier needs
+
+Phase 5a proved the hard, genuinely-distributed part of this
+deployment works. Phase 5b is comparatively simple: 3 more `Ec2Service`s
+on the SAME `ServicesStack`, bin-packed onto the app-tier capacity pool
+alongside Schema Registry, giving the 8 Spring Boot services (Phase 5c)
+everywhere they need to read/write once they're deployed —
+order-service's Postgres-backed outbox, the 4 shared Redis use cases,
+and search-indexer-service's Elasticsearch target.
+
+### Why none of these 3 need `distinctInstances`
+
+Phase 5a's Kafka brokers needed `distinctInstances` because there were
+3 REPLICAS of the same role, and losing more than 1 to a single
+instance failure would defeat the whole point of the demo. Postgres,
+Redis, and Elasticsearch here are each a SINGLE instance of their
+role — there's nothing to "spread across instances" when there's only
+one of a thing. They bin-pack onto the app-tier pool exactly like
+Schema Registry already does, no placement constraint needed.
+
+### Applying Phase 5a's lesson proactively instead of finding it live again
+
+Phase 5a's real permission bug (non-root container + root-owned bind
+mount) wasn't specific to Kafka — it's a property of ANY image that
+runs as a non-root user and writes to a host-mounted path. Rather than
+deploy all 3 new services and wait to see which one(s) crash-loop, each
+image's actual container user was checked directly, first:
+
+```bash
+$ docker inspect postgres:16 --format '{{.Config.User}}'
+                                            # empty — no USER directive
+$ docker inspect redis:7 --format '{{.Config.User}}'
+                                            # empty — no USER directive
+$ docker inspect docker.elastic.co/elasticsearch/elasticsearch:8.15.0 --format '{{.Config.User}}'
+1000:0
+```
+
+An empty `Config.User` doesn't mean "runs as root forever" — it means
+the container's INITIAL process is root, which for both `postgres:16`
+and `redis:7`'s official entrypoint scripts is deliberate: their
+entrypoints run any needed setup (including `chown`-ing their own data
+directory) AS root, then drop privileges internally before starting the
+actual database/server process. Confirmed directly rather than assumed,
+since Phase 5a already showed the cost of guessing wrong once:
+
+```bash
+$ docker run --rm postgres:16 id
+uid=0(root) gid=0(root) groups=0(root)
+$ docker run --rm redis:7 id
+uid=0(root) gid=0(root) groups=0(root)
+$ docker run --rm docker.elastic.co/elasticsearch/elasticsearch:8.15.0 id
+uid=1000(elasticsearch) gid=0(root) groups=0(root)
+```
+
+Only Elasticsearch is in the same situation Kafka was: an explicit,
+permanent non-root `USER 1000:0` Dockerfile directive, confirmed by
+`id` reporting `uid=1000` even for the container's very first process.
+`EcsClusterStack`'s app-tier Auto Scaling Group got the same kind of
+`UserData` fix Phase 5a's Kafka pool already has, added BEFORE the
+first Phase 5b deploy attempt rather than after a crash-loop:
+
+```typescript
+appAsg.addUserData(
+  'mkdir -p /data/elasticsearch',
+  'chown -R 1000:0 /data/elasticsearch',
+);
+```
+
+Postgres and Redis got plain bind mounts with no `chown` step — adding
+one would have been harmless but pointless, since their own entrypoints
+already handle it. (Redis, matching the local `docker-compose.yml`
+exactly, gets no persistent volume at all — see the code's own comment
+for why all 4 of its use cases here are legitimately fine losing their
+contents on a restart.)
+
+### The other lesson from Phase 5a, also applied proactively this time: replace already-running instances
+
+Phase 5a discovered, the hard way, that an Auto Scaling Group launch
+template change doesn't retroactively affect instances that are
+already running. This time, with that lesson already learned, the fix
+was applied BEFORE deploying the new services, not after:
+
+```bash
+$ node_modules/.bin/cdk deploy OrderFlowEcsClusterStack ...   # ships the UserData fix
+$ aws ec2 terminate-instances --instance-ids i-07846ff... i-0f9eed4...  # the 2 OLD app-tier instances
+# wait for the ASG to launch 2 replacements from the now-current template
+$ node_modules/.bin/cdk deploy OrderFlowServicesStack ...     # only now bring up Postgres/Redis/Elasticsearch
+```
+
+### Verified live: all 3 services healthy on the FIRST deploy attempt
+
+```bash
+$ aws ecs describe-services --cluster orderflow-cluster \
+    --services kafka-1 kafka-2 kafka-3 schema-registry postgres redis elasticsearch \
+    --query 'services[].{name:serviceName,running:runningCount,desired:desiredCount,pending:pendingCount}' --output table
++---------+-------------------+----------+-----------+
+| desired |       name        | pending  |  running  |
++---------+-------------------+----------+-----------+
+|  1      |  kafka-1          |  0       |  1        |
+|  1      |  kafka-2          |  0       |  1        |
+|  1      |  kafka-3          |  0       |  1        |
+|  1      |  schema-registry  |  0       |  1        |
+|  1      |  postgres         |  0       |  1        |
+|  1      |  redis            |  0       |  1        |
+|  1      |  elasticsearch    |  0       |  1        |
++---------+-------------------+----------+-----------+
+```
+
+No crash-loop this time — every service reached `CREATE_COMPLETE`
+inside the same single `cdk deploy OrderFlowServicesStack` run,
+confirmed against each service's own CloudWatch logs, not just
+CloudFormation's steady-state signal:
+
+```
+# Postgres:
+2026-08-08 05:42:01.424 UTC [1] LOG:  database system is ready to accept connections
+
+# Redis:
+1:M 08 Aug 2026 05:41:56.032 * Ready to accept connections tcp
+
+# Elasticsearch: no permission/denied/exception lines anywhere in the
+# full log (checked from the very first line, not just the tail), node
+# started, and it immediately began writing real data — dozens of
+# index lifecycle policies and index templates — to the bind-mounted
+# /usr/share/elasticsearch/data, which is itself proof the mount is
+# writable, not just that the process didn't immediately crash:
+"message":"started {ip-172-31-75-193.ec2.internal}{...}{8.15.0}..."
+"message":"adding index lifecycle policy [90-days-default]"
+"message":"adding index lifecycle policy [180-days-default]"
+# ... (dozens more, all successful)
+```
+
+Deployment time for the whole `ServicesStack` update (3 new services,
+no rework needed): **144.29s** — a useful, honest contrast against
+Phase 5a's inflated ~33-minute number, since this run had no live
+debugging baked into it. This is close to what a "normal," bug-free
+`ServicesStack` change actually costs: mostly the time for 3 ECS
+services to place their tasks and reach steady state, once real
+capacity already exists.
+
+### One dead end, noted rather than pursued: SSM `send-command` to check the fix before deploying
+
+Before deploying `ServicesStack`, an attempt was made to verify the
+`chown` had actually run on the 2 new app-tier instances FIRST, via
+`aws ssm send-command` (which — unlike `aws ecs execute-command`,
+Phase 5a's ECS Exec — talks to the EC2 instance directly and doesn't
+need the local `session-manager-plugin` binary):
+
+```bash
+$ aws ssm send-command --instance-ids i-060e43... --document-name AWS-RunShellScript ...
+An error occurred (InvalidInstanceId): Instances not in a valid state for account
+```
+
+This project's EC2 instance IAM role has never been granted SSM's
+managed-instance permissions (`AmazonSSMManagedInstanceCore` or
+equivalent) — a real, sensible gap, not a bug: this project deliberately
+has no SSH ingress rule anywhere (Phase 3's `NetworkStack`) and relies
+on ECS Exec (scoped to the ECS TASK role, not the underlying EC2
+instance role) for container-level debugging instead. Direct
+host-level access was never a design goal here, so this was left
+unaddressed rather than granting broader IAM permissions than the
+project actually needs — the deploy-then-check-CloudWatch-logs
+approach (used successfully in both Phase 5a and this phase) covers the
+same verification need without it.
+
+---
+
+## 🎓 Concepts learned in Phase 5b
+
+1. **`docker inspect --format '{{.Config.User}}'` and `docker run <image>
+   id` answer different questions.** An empty `Config.User` means no
+   Dockerfile `USER` directive was set — the container's very first
+   process starts as root, but that says nothing about whether the
+   actual SERVER process ends up running as root too. Many official
+   database images (Postgres, Redis here) deliberately start as root,
+   self-fix ownership on their data directory, then drop to an
+   unprivileged user internally — checking with `docker run ... id`
+   only shows the INITIAL process, not this internal handoff.
+2. **A bug found once in one service is worth checking for in every
+   OTHER service before deploying them, not just fixing where it was
+   found.** Phase 5a's Kafka permission bug generalizes to "non-root
+   image + host bind mount" — applying that lens to Postgres, Redis,
+   and Elasticsearch BEFORE deploying (rather than after a second
+   crash-loop) is what turned a repeat live-debugging session into a
+   244-second, first-attempt-clean deploy.
+3. **Not every persistent-seeming service needs a persistent volume.**
+   Redis here intentionally has none — matching its actual role
+   (cache, dedupe store, rate limiter, lock — all fine to reset) rather
+   than defaulting to "give it a volume because it's a database-shaped
+   thing."
+4. **IAM scope should match what a system actually needs, not what
+   would be convenient to have.** Not wiring up SSM managed-instance
+   access (which would have made a nice-to-have verification step
+   easier) was a deliberate non-decision, consistent with this
+   project's existing "no SSH ingress rule anywhere, ECS Exec only"
+   design — a gap surfaced by trying something and hitting a real IAM
+   boundary, not a bug.
+
+## 🧠 Interview Q&A
+
+**Q: How do you know whether a Docker image's ACTUAL server process
+runs as root, versus just its container's first process?**
+A: `docker inspect --format '{{.Config.User}}'` and `docker run <image>
+id` only show the INITIAL process's user — for many official database
+images, that's deliberately root, so the entrypoint script can perform
+root-only setup (like fixing ownership on a mounted data directory)
+before internally dropping privileges (via `gosu`/`su-exec`) and
+starting the real server process unprivileged. The only fully reliable
+way to know the ACTUAL server process's user is to check the image's
+entrypoint script directly, or observe the running container's process
+list — an empty `Config.User` is evidence of "no enforced non-root
+user," not proof the server ends up running as root.
+
+**Q: You found and fixed a bug in one service (say, a permission issue
+between a non-root container and a host volume). Do you need to check
+your other services for the same bug?**
+A: Yes — the fix for one instance of a general class of bug (non-root
+container + host-owned mount, in this case) doesn't fix the class
+itself. Before deploying similar services, checking each one's actual
+container user against whether the fix was already applied (here: only
+Elasticsearch needed it; Postgres and Redis didn't) turns a
+"same bug, found again, live" repeat incident into a preventive check
+that costs a few `docker inspect` commands.
+
+**Q: Would you give every EC2 instance in your cluster SSM Session
+Manager access, "just in case" you need to debug something on the
+host?**
+A: Only if there's an actual need for host-level access that
+container-level tooling can't cover. This project deliberately has no
+SSH ingress anywhere and relies on ECS Exec (scoped narrowly to the ECS
+task role) for the debugging it actually needs — adding
+`AmazonSSMManagedInstanceCore` to the EC2 instance role broadens what a
+compromised task/instance could do, for a capability (arbitrary
+host-level shell access) the project doesn't have an active need for.
+The right call is scoping IAM to what's actually used, and treating "it
+would be convenient to have" as insufficient justification on its own.
+
+**Q: A stateful service (cache, queue, session store) doesn't have a
+persistent volume in your deployment. Is that automatically a bug?**
+A: Not automatically — it depends on whether losing that service's data
+on restart is actually a problem for how it's used. A cache backed by a
+real source of truth, a short-TTL dedupe/rate-limit store, or a lock
+that just gets re-acquired are all legitimately fine without
+persistence; a system of record (a database holding data with no other
+copy) is not. The question to ask is "what actually breaks if this
+process restarts with an empty disk," not "is this the kind of thing
+that usually gets a volume."
+process's possibly-stale opinion.
