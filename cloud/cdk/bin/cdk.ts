@@ -6,6 +6,8 @@ import { EcsClusterStack } from '../lib/ecs-cluster-stack';
 import { EcrStack } from '../lib/ecr-stack';
 import { ServicesStack } from '../lib/services-stack';
 import { AppServicesStack } from '../lib/app-services-stack';
+import { FrontendStack } from '../lib/frontend-stack';
+import { GithubOidcStack } from '../lib/github-oidc-stack';
 
 const app = new cdk.App();
 
@@ -79,4 +81,21 @@ new AppServicesStack(app, 'OrderFlowAppServicesStack', {
   internalSecurityGroup: servicesStack.internalSecurityGroup,
   namespace: servicesStack.namespace,
   repositories: ecrStack.repositories,
+});
+
+// Independent of the ECS/Kafka stacks above, same reasoning as EcrStack:
+// no VPC or cluster needed, just an S3 bucket + a CloudFront
+// distribution. See docs/frontend-architecture.md section 1 for why this
+// is a static SPA (S3+CloudFront) rather than another ECS service.
+const frontendStack = new FrontendStack(app, 'OrderFlowFrontendStack', { env });
+
+// Deploys last because its IAM policies reference EcrStack's repository
+// ARNs and FrontendStack's bucket/distribution — CDK infers this
+// dependency automatically from the props passed below, same mechanism
+// as every other cross-stack reference in this file.
+new GithubOidcStack(app, 'OrderFlowGithubOidcStack', {
+  env,
+  repositories: ecrStack.repositories,
+  frontendBucket: frontendStack.bucket,
+  frontendDistribution: frontendStack.distribution,
 });

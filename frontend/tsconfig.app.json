@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],
+    "allowArbitraryExtensions": true,
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* "@/x" resolves to "src/x" everywhere (components, api, tests) so a
+       file's import path doesn't depend on how deeply it's nested — see
+       vite.config.ts's matching `resolve.alias`, which is what actually
+       makes this work at build/dev-server time (TS only checks types,
+       it doesn't resolve modules for the bundler). No "baseUrl" needed
+       alongside "paths" — TS 6+ resolves "paths" entries relative to this
+       tsconfig file's own directory once "baseUrl" is absent; setting
+       "baseUrl" explicitly is deprecated as of TS 6.0. */
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src"]
+}
