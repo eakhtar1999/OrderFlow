@@ -73,6 +73,16 @@ class CoreOrderFlowIntegrationTest {
 
     private static final String MOCK_SCHEMA_REGISTRY_URL = "mock://search-indexer-core-flow-test";
 
+    // Bumped from an original 15s: this project's GitHub Actions CI
+    // (backend-ci.yml) surfaced real Kafka consumer disconnects/
+    // rebalances on the hosted runner (see that workflow's first run
+    // against this file) that pushed indexing latency past 15s — a
+    // budget that was only ever tuned against a local dev machine's much
+    // more consistent scheduling/network. 45s gives real, if CI-slow,
+    // event processing enough room without letting a genuine hang stall
+    // the build indefinitely.
+    private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(45);
+
     @DynamicPropertySource
     static void overrideProperties(DynamicPropertyRegistry registry) {
         registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
@@ -96,7 +106,7 @@ class CoreOrderFlowIntegrationTest {
                     orderOf(orderId, customerId, "us-east", 19.98)));
             producer.flush();
 
-            Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
                 OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
                 assertThat(doc).isNotNull();
                 assertThat(doc.getStatus()).isEqualTo("CREATED");
@@ -122,7 +132,7 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
             assertThat(doc).isNotNull();
             assertThat(doc.getStatus()).isEqualTo("SHIPPED");
@@ -154,7 +164,7 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
             assertThat(doc).isNotNull();
             assertThat(doc.getStatus()).isEqualTo("INVENTORY_FAILED");
@@ -190,7 +200,7 @@ class CoreOrderFlowIntegrationTest {
             // of the behavior (see OrderDocumentIndexer's own Javadoc:
             // "whichever event happens to arrive FIRST for a given
             // orderId creates the document with just its own fields").
-            Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
                 OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
                 assertThat(doc).isNotNull();
                 assertThat(doc.getStatus()).isEqualTo("SHIPPED");
@@ -220,7 +230,7 @@ class CoreOrderFlowIntegrationTest {
         // comparing timestamps) remains deliberately unbuilt — this test
         // exists to make the gap impossible to silently regress FURTHER,
         // not to fix it.
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
             assertThat(doc).isNotNull();
             assertThat(doc.getStatus()).isEqualTo("CREATED");
@@ -249,7 +259,7 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             assertThat(elasticsearchOperations.get(matchingOrderId, OrderDocument.class)).isNotNull();
             assertThat(elasticsearchOperations.get(nonMatchingOrderId, OrderDocument.class)).isNotNull();
         });
@@ -282,7 +292,7 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrdersPerMinuteDocument doc = elasticsearchOperations.get(
                     String.valueOf(windowStart), OrdersPerMinuteDocument.class);
             assertThat(doc).isNotNull();
