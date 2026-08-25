@@ -56,5 +56,21 @@ jobs:
       # pass. -B (batch mode: no interactive/color output, appropriate
       # for a non-interactive CI log) -ntp (no transfer progress: skips
       # the very noisy per-file download progress spam in the log).
+      #
+      # -Dsurefire.rerunFailingTestsCount=2: this repo's first-ever
+      # backend-ci.yml run surfaced real flakiness in
+      # search-indexer-service's Testcontainers-based integration tests —
+      # GitHub's shared hosted runner has noisy, variable CPU availability
+      # that a local dev machine doesn't, so a real Kafka broker's
+      # consumer-group rebalancing occasionally takes longer than usual.
+      # Bumping the test's own Awaitility timeout only chased that
+      # variance (a LARGER timeout made a later run WORSE, not better —
+      # see CoreOrderFlowIntegrationTest's own comment) — the actually
+      # correct tool for transient CI-environment flakiness is retrying
+      # the failed test, not guessing a bigger fixed number. Surefire
+      # reruns ONLY tests that failed, up to twice, and still fails the
+      # build if a test fails on every attempt — a real, consistent
+      # regression still fails CI, it just won't fail from a one-off
+      # noisy-neighbor blip.
       - name: mvn verify (build + unit + integration tests, whole reactor)
-        run: mvn -B -ntp verify
+        run: mvn -B -ntp -Dsurefire.rerunFailingTestsCount=2 verify
