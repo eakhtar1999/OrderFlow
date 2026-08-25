@@ -73,15 +73,17 @@ class CoreOrderFlowIntegrationTest {
 
     private static final String MOCK_SCHEMA_REGISTRY_URL = "mock://search-indexer-core-flow-test";
 
-    // Bumped from an original 15s: this project's GitHub Actions CI
-    // (backend-ci.yml) surfaced real Kafka consumer disconnects/
-    // rebalances on the hosted runner (see that workflow's first run
-    // against this file) that pushed indexing latency past 15s — a
-    // budget that was only ever tuned against a local dev machine's much
-    // more consistent scheduling/network. 45s gives real, if CI-slow,
-    // event processing enough room without letting a genuine hang stall
-    // the build indefinitely.
-    private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(45);
+    // Bumped from an original 15s, then 45s: this project's GitHub Actions
+    // CI (backend-ci.yml) surfaced real Kafka consumer disconnects/
+    // rebalances on the hosted runner's shared 2-vCPU capacity (see that
+    // workflow's first two runs against this file) — this class boots a
+    // real Kafka + Elasticsearch + Spring context via Testcontainers and
+    // runs 5 tests against ONE shared static broker, so CPU contention
+    // compounds across the class, not just within a single test. 90s
+    // gives real, if CI-slow, event processing enough room without
+    // letting a genuine hang stall the build indefinitely — still well
+    // under backend-ci.yml's own job-level timeout.
+    private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(90);
 
     @DynamicPropertySource
     static void overrideProperties(DynamicPropertyRegistry registry) {
