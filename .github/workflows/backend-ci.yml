@@ -1,0 +1,60 @@
+# Read docs/github-actions-fundamentals.md first if any syntax here is
+# unfamiliar — this file's comments assume you already know that
+# vocabulary (on/jobs/steps, uses vs run, caching) and explain only what's
+# SPECIFIC to this file.
+#
+# Automatic on every push/PR touching backend code. Deliberately requests
+# NO AWS credentials (no `permissions: id-token: write`, no AWS step) —
+# this is pure build/test, safe to run on every PR including ones from a
+# fork, with zero chance of touching billable infrastructure.
+name: Backend CI
+
+# Quoted "on" (not bare `on:`) — deliberate: unquoted `on`/`yes`/`no`/etc.
+# are YAML 1.1 boolean literals, so strict YAML tooling parses a bare
+# `on:` key as the boolean `true`, not the string "on". GitHub's own
+# workflow parser special-cases this and works either way, but quoting
+# it removes the ambiguity for every other YAML tool that might ever
+# read this file (linters, `yaml.safe_load`, etc.).
+"on":
+  push:
+    branches: [main]
+    paths: &backend-paths
+      - 'order-service/**'
+      - 'inventory-service/**'
+      - 'payment-service/**'
+      - 'shipment-service/**'
+      - 'fraud-detection-service/**'
+      - 'analytics-service/**'
+      - 'order-saga-orchestrator/**'
+      - 'search-indexer-service/**'
+      - 'avro-schemas/**'
+      - 'pom.xml'
+      - '.github/workflows/backend-ci.yml'
+  pull_request:
+    paths: *backend-paths
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-java's built-in `cache: maven` hashes pom.xml files to key
+      # the cache — it restores ~/.m2 automatically and re-saves it at
+      # the end of the job if any pom.xml changed. One line, no separate
+      # actions/cache step (see docs/github-actions-fundamentals.md §4).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # ONE command for the whole 8-service reactor, not a per-service
+      # matrix — see docs/github-actions-fundamentals.md §5 for why: this
+      # is one Maven multi-module project (root pom.xml), and `mvn verify`
+      # already builds+tests every module in dependency order in a single
+      # pass. -B (batch mode: no interactive/color output, appropriate
+      # for a non-interactive CI log) -ntp (no transfer progress: skips
+      # the very noisy per-file download progress spam in the log).
+      - name: mvn verify (build + unit + integration tests, whole reactor)
+        run: mvn -B -ntp verify

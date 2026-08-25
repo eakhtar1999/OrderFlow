@@ -1,0 +1,40 @@
+# Read docs/github-actions-fundamentals.md first. This file's the
+# frontend's counterpart of backend-ci.yml — same "automatic, no AWS
+# credentials, path-filtered" shape, applied to frontend/ instead of the
+# Maven reactor.
+name: Frontend CI
+
+"on":
+  push:
+    branches: [main]
+    paths: &frontend-paths
+      - 'frontend/**'
+      - '.github/workflows/frontend-ci.yml'
+  pull_request:
+    paths: *frontend-paths
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-node's built-in `cache: npm` needs `cache-dependency-path`
+      # here specifically because frontend/ isn't the repo root — without
+      # it, setup-node looks for a package-lock.json at the repo root
+      # (where there isn't one; the Maven reactor lives there instead)
+      # and silently skips caching rather than failing loudly.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test
+      - run: npm run build
