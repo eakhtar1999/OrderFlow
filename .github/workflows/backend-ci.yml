@@ -57,26 +57,26 @@ jobs:
       # for a non-interactive CI log) -ntp (no transfer progress: skips
       # the very noisy per-file download progress spam in the log).
       #
-      # KNOWN, FLAGGED-NOT-FIXED GAP: this repo's first-ever backend-ci.yml
-      # runs surfaced real, intermittent flakiness in
+      # PREVIOUSLY-FLAGGED GAP, NOW FIXED: this repo's first-ever
+      # backend-ci.yml runs surfaced real, intermittent flakiness in
       # search-indexer-service's CoreOrderFlowIntegrationTest on GitHub's
       # shared hosted runner (noisy/variable CPU slows real Kafka consumer
-      # rebalancing past the test's own Awaitility timeout — see that
-      # class's own comment). Two mitigations were tried and both made
-      # things WORSE, not better, so neither is applied here:
-      #   1. A bigger fixed timeout (90s) — pure noisy-neighbor variance,
-      #      not something a bigger number converges on.
-      #   2. `-Dsurefire.rerunFailingTestsCount` — actively harmful for
-      #      this specific test: a rerun restarts the test class, which
-      #      re-triggers Testcontainers' `static` Elasticsearch/Kafka
-      #      containers into launching FRESH containers, but Spring's
-      #      ApplicationContext caching reuses the OLD cached context
-      #      still wired to the previous (now-dead) container's address —
-      #      a documented Surefire-rerun + Spring-Boot-Testcontainers
-      #      incompatibility when using static, class-shared containers.
-      # A real fix would mean restructuring this test's container
-      # lifecycle (e.g. `@DirtiesContext` or per-method containers) —
-      # out of scope for this PR, which only ADDS CI, not backend test
-      # infrastructure. Flagged here rather than silently masked.
+      # rebalancing past the test's own Awaitility timeout). A bigger fixed
+      # timeout (90s) made things WORSE, not better — clear evidence this
+      # is pure noisy-neighbor variance, not a value any single timeout
+      # converges on. `-Dsurefire.rerunFailingTestsCount` was ALSO tried
+      # and made things worse for a completely different reason: that test
+      # class's `@Testcontainers`-managed static containers got restarted
+      # into FRESH containers on a rerun, while Spring's ApplicationContext
+      # caching kept reusing the OLD context wired to the dead container's
+      # address. That specific incompatibility is now fixed at the source
+      # — CoreOrderFlowIntegrationTest switched to Testcontainers' own
+      # "singleton container" pattern (manual static-block startup, no
+      # JUnit extension managing lifecycle), so nothing can restart those
+      # containers mid-JVM regardless of how many times a test is rerun.
+      # With that structural bug gone, a Surefire rerun is exactly the
+      # right tool for the REMAINING problem (genuine, occasional
+      # transient slowness on a shared runner) — one retry, not more,
+      # since this is meant to absorb noise, not mask a real regression.
       - name: mvn verify (build + unit + integration tests, whole reactor)
-        run: mvn -B -ntp verify
+        run: mvn -B -ntp verify -Dsurefire.rerunFailingTestsCount=1
