@@ -80,10 +80,15 @@ class CoreOrderFlowIntegrationTest {
     // things WORSE across a subsequent run (more tests timed out, not
     // fewer) — clear evidence this is run-to-run noisy-neighbor variance
     // on a shared runner, not a value this timeout can be tuned to fully
-    // absorb. 45s stays as a reasonable, evidence-based middle ground;
-    // backend-ci.yml's own `-Dsurefire.rerunFailingTestsCount` is what
-    // actually absorbs the remaining transient flakiness, by retrying a
-    // failed test rather than by guessing a bigger number here.
+    // absorb. A Surefire rerun (`-Dsurefire.rerunFailingTestsCount`) was
+    // also tried and reverted — it's actively harmful for this specific
+    // test, since a rerun restarts the test class and launches FRESH
+    // Testcontainers-managed containers, while Spring's ApplicationContext
+    // caching keeps reusing the OLD cached context still wired to the
+    // previous (now-dead) container's address. See backend-ci.yml's own
+    // comment for the full explanation — neither mitigation is applied
+    // there; this remains a known, deliberately out-of-scope flaky-test
+    // gap, not a value this timeout alone can fully absorb.
     private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(45);
 
     @DynamicPropertySource
