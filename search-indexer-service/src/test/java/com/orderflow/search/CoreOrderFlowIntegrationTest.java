@@ -289,19 +289,34 @@ class CoreOrderFlowIntegrationTest {
             assertThat(elasticsearchOperations.get(nonMatchingOrderId, OrderDocument.class)).isNotNull();
         });
 
+        // The REAL, deterministic root cause of this test's flakiness,
+        // finally found and fixed: elasticsearchOperations.get(id, ...)
+        // above is a real-time GET BY ID, which Elasticsearch always
+        // serves immediately after an index write. A SEARCH query (what
+        // /api/search/orders actually runs) is different — Elasticsearch
+        // is near-real-time for search specifically, refreshing its
+        // search-visible index on an interval (default ~1s), not on every
+        // write. A document confirmed present via get() one line above can
+        // still be genuinely invisible to a search query issued
+        // immediately after, especially under CI's slower/noisier I/O.
+        // Every other assertion in this file already polls with
+        // Awaitility; this one didn't, which is the actual bug — not
+        // "flaky CI," a real, fixable read-after-write gap.
         TestRestTemplate rest = new TestRestTemplate();
-        List<?> results = rest.getForObject(
-                "http://localhost:" + port + "/api/search/orders?region=us-east&status=CREATED",
-                List.class);
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
+            List<?> results = rest.getForObject(
+                    "http://localhost:" + port + "/api/search/orders?region=us-east&status=CREATED",
+                    List.class);
 
-        assertThat(results).isNotEmpty();
-        boolean containsMatching = results.stream()
-                .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(matchingOrderId));
-        boolean containsNonMatching = results.stream()
-                .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(nonMatchingOrderId));
+            assertThat(results).isNotEmpty();
+            boolean containsMatching = results.stream()
+                    .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(matchingOrderId));
+            boolean containsNonMatching = results.stream()
+                    .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(nonMatchingOrderId));
 
-        assertThat(containsMatching).isTrue();
-        assertThat(containsNonMatching).isFalse();
+            assertThat(containsMatching).isTrue();
+            assertThat(containsNonMatching).isFalse();
+        });
     }
 
     @Test
