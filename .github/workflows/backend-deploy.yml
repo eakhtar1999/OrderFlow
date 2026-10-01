@@ -1,0 +1,130 @@
+# Read docs/github-actions-fundamentals.md first — especially §6 (OIDC)
+# and the "Phase 0 setup" section at the bottom, which MUST be done once,
+# by hand, before this workflow's AWS steps can succeed at all
+# (OrderFlowGithubOidcStack has to actually be deployed for the role this
+# workflow assumes to exist).
+#
+# Manual trigger ONLY (workflow_dispatch) — no push/pull_request trigger.
+# See docs/github-actions-fundamentals.md §6 for why: this project's
+# up.sh/down.sh already put a human in the loop before any billable AWS
+# change, and this workflow keeps that same discipline for deploys.
+name: Backend Deploy
+
+"on":
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Which service to build+push+redeploy (or "all")'
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - order-service
+          - inventory-service
+          - payment-service
+          - shipment-service
+          - fraud-detection-service
+          - analytics-service
+          - order-saga-orchestrator
+          - search-indexer-service
+
+permissions:
+  id-token: write   # required for the AWS OIDC step below — see fundamentals doc §3
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 027677879393.dkr.ecr.us-east-1.amazonaws.com
+  ECS_CLUSTER: orderflow-cluster
+  # This ARN is fully deterministic, not a secret — OrderFlowGithubOidcStack
+  # (cloud/cdk/lib/github-oidc-stack.ts) pins `roleName:
+  # 'orderflow-github-deploy-role'` explicitly, in account 027677879393
+  # (see docs/aws-cloud-deployment.md's account check). It only WORKS once
+  # that stack is actually deployed (Phase 0 setup, fundamentals doc).
+  DEPLOY_ROLE_ARN: arn:aws:iam::027677879393:role/orderflow-github-deploy-role
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      # -DskipTests, not a bare `mvn package`: backend-ci.yml already ran
+      # the full `mvn verify` (build + all tests) on this exact commit
+      # when it was pushed/merged to main — re-running the whole test
+      # suite again here would just slow down every deploy for no new
+      # information, since nothing about the source changed between CI
+      # passing and this workflow being manually triggered.
+      - name: mvn package (whole reactor — see docs/aws-cloud-deployment.md Phase 1 on why per-service builds still need every module's pom.xml present)
+        run: mvn -B -ntp -DskipTests package
+
+      # Resolves the "all" choice into a real bash array once, so every
+      # step below (Docker build, ECR push, ECS update) loops over the
+      # same list without repeating this if/else.
+      - name: Determine which service(s) to deploy
+        id: services
+        run: |
+          if [ "${{ inputs.service }}" = "all" ]; then
+            echo 'list=order-service inventory-service payment-service shipment-service fraud-detection-service analytics-service order-saga-orchestrator search-indexer-service' >> "$GITHUB_OUTPUT"
+          else
+            echo 'list=${{ inputs.service }}' >> "$GITHUB_OUTPUT"
+          fi
+
+      # Repo root as build context, exactly as docs/aws-cloud-deployment.md
+      # Phase 1 documents (and cloud/scripts/build-and-push.sh already
+      # assumes) — every Dockerfile's build stage COPYs the root pom.xml
+      # and every module's pom.xml before its own source, because the
+      # reactor's parent pom + avro-schemas live outside any single
+      # service's own directory.
+      - name: docker build (each selected service)
+        run: |
+          for service in ${{ steps.services.outputs.list }}; do
+            docker build -f "$service/Dockerfile" -t "orderflow/$service:latest" .
+          done
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Same two-step "fetch a short-lived token, pipe straight into
+      # docker login --password-stdin" pattern
+      # cloud/scripts/build-and-push.sh already uses, and for the same
+      # reason: the old `aws ecr get-login` command printed a full
+      # `docker login` command (password included) to shell history — a
+      # real credential-leak footgun this avoids.
+      - name: Log in to ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: docker push (each selected service)
+        run: |
+          for service in ${{ steps.services.outputs.list }}; do
+            docker tag "orderflow/$service:latest" "$ECR_REGISTRY/orderflow/$service:latest"
+            docker push "$ECR_REGISTRY/orderflow/$service:latest"
+          done
+
+      # AppServicesStack's task definitions reference the `latest` tag by
+      # NAME (ecs.ContainerImage.fromEcrRepository(repo, 'latest')), not a
+      # pinned digest — see cloud/cdk/lib/app-services-stack.ts. That
+      # means a fresh `docker push` above already updated what "latest"
+      # points to in ECR; --force-new-deployment is what makes ECS
+      # actually stop the old task and start a new one that re-pulls it.
+      # No `cdk deploy` needed for a routine image update.
+      - name: Roll out on ECS (force new deployment)
+        run: |
+          for service in ${{ steps.services.outputs.list }}; do
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$service" \
+              --force-new-deployment \
+              --no-cli-pager
+          done

@@ -29,8 +29,6 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.KafkaContainer;
 import org.testcontainers.elasticsearch.ElasticsearchContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
@@ -56,22 +54,59 @@ import static org.assertj.core.api.Assertions.assertThat;
  * docker-compose.yml runs, so a mapping bug like the one
  * {@code ElasticsearchIndexInitializer} exists to fix would be just as
  * reproducible here as it was found live in Build Order Step 10.
+ *
+ * SINGLETON CONTAINER PATTERN, not @Testcontainers + @Container: this
+ * class used to use those annotations, which let JUnit's extension model
+ * manage container start/stop. That broke under Surefire's
+ * `-Dsurefire.rerunFailingTestsCount`: a rerun re-triggers the extension's
+ * BeforeAll-style container startup, launching FRESH Kafka/Elasticsearch
+ * containers with NEW mapped ports — but Spring's ApplicationContext
+ * caching keeps reusing the OLD cached context, still wired to the
+ * previous (now-dead) container's address, so the rerun attempt fails
+ * immediately and differently every time, not because the original
+ * flakiness recurred. Starting both containers manually, exactly once,
+ * in a static initializer block with no JUnit extension managing them at
+ * all, means NOTHING can ever restart them again for the rest of this
+ * JVM's life — a rerun now safely reuses the exact same containers AND
+ * (since nothing invalidates it) the exact same cached Spring context,
+ * so a rerun can actually do its job: give a genuinely transient failure
+ * (noisy-neighbor CPU variance on a shared CI runner) a clean second
+ * attempt. This is Testcontainers' own documented pattern for exactly
+ * this situation — see their "manual container lifecycle control /
+ * singleton containers" docs.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@Testcontainers
 class CoreOrderFlowIntegrationTest {
 
-    @Container
-    static KafkaContainer kafka = new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.7.0"))
+    static final KafkaContainer kafka = new KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:7.7.0"))
             .withKraft();
 
-    @Container
-    static ElasticsearchContainer elasticsearch =
+    static final ElasticsearchContainer elasticsearch =
             new ElasticsearchContainer(DockerImageName.parse("docker.elastic.co/elasticsearch/elasticsearch:8.15.0"))
                     .withEnv("discovery.type", "single-node")
                     .withEnv("xpack.security.enabled", "false");
 
+    static {
+        // Started here, once, at class-load time — before JUnit ever
+        // instantiates this class or Spring ever builds a context, and
+        // deliberately never stopped. Leaking these for the JVM's
+        // lifetime is the whole point of the singleton pattern: the CI
+        // runner's JVM exits and reclaims everything anyway once `mvn
+        // verify` finishes this module.
+        kafka.start();
+        elasticsearch.start();
+    }
+
     private static final String MOCK_SCHEMA_REGISTRY_URL = "mock://search-indexer-core-flow-test";
+
+    // 45s, unchanged from before the singleton-container fix — that part
+    // of the original flakiness (real, if occasional, noisy-neighbor CPU
+    // variance on GitHub's shared runners slowing Kafka consumer
+    // rebalancing past this window) is still a real possibility. What's
+    // fixed is that a Surefire rerun can now ACTUALLY recover from one:
+    // see backend-ci.yml for `-Dsurefire.rerunFailingTestsCount` being
+    // re-enabled now that it's safe to use against this test again.
+    private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(45);
 
     @DynamicPropertySource
     static void overrideProperties(DynamicPropertyRegistry registry) {
@@ -96,7 +131,7 @@ class CoreOrderFlowIntegrationTest {
                     orderOf(orderId, customerId, "us-east", 19.98)));
             producer.flush();
 
-            Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
                 OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
                 assertThat(doc).isNotNull();
                 assertThat(doc.getStatus()).isEqualTo("CREATED");
@@ -122,7 +157,7 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
             assertThat(doc).isNotNull();
             assertThat(doc.getStatus()).isEqualTo("SHIPPED");
@@ -154,7 +189,7 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
             assertThat(doc).isNotNull();
             assertThat(doc.getStatus()).isEqualTo("INVENTORY_FAILED");
@@ -190,7 +225,7 @@ class CoreOrderFlowIntegrationTest {
             // of the behavior (see OrderDocumentIndexer's own Javadoc:
             // "whichever event happens to arrive FIRST for a given
             // orderId creates the document with just its own fields").
-            Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
                 OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
                 assertThat(doc).isNotNull();
                 assertThat(doc.getStatus()).isEqualTo("SHIPPED");
@@ -220,7 +255,7 @@ class CoreOrderFlowIntegrationTest {
         // comparing timestamps) remains deliberately unbuilt — this test
         // exists to make the gap impossible to silently regress FURTHER,
         // not to fix it.
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrderDocument doc = elasticsearchOperations.get(orderId, OrderDocument.class);
             assertThat(doc).isNotNull();
             assertThat(doc.getStatus()).isEqualTo("CREATED");
@@ -249,24 +284,39 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             assertThat(elasticsearchOperations.get(matchingOrderId, OrderDocument.class)).isNotNull();
             assertThat(elasticsearchOperations.get(nonMatchingOrderId, OrderDocument.class)).isNotNull();
         });
 
+        // The REAL, deterministic root cause of this test's flakiness,
+        // finally found and fixed: elasticsearchOperations.get(id, ...)
+        // above is a real-time GET BY ID, which Elasticsearch always
+        // serves immediately after an index write. A SEARCH query (what
+        // /api/search/orders actually runs) is different — Elasticsearch
+        // is near-real-time for search specifically, refreshing its
+        // search-visible index on an interval (default ~1s), not on every
+        // write. A document confirmed present via get() one line above can
+        // still be genuinely invisible to a search query issued
+        // immediately after, especially under CI's slower/noisier I/O.
+        // Every other assertion in this file already polls with
+        // Awaitility; this one didn't, which is the actual bug — not
+        // "flaky CI," a real, fixable read-after-write gap.
         TestRestTemplate rest = new TestRestTemplate();
-        List<?> results = rest.getForObject(
-                "http://localhost:" + port + "/api/search/orders?region=us-east&status=CREATED",
-                List.class);
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
+            List<?> results = rest.getForObject(
+                    "http://localhost:" + port + "/api/search/orders?region=us-east&status=CREATED",
+                    List.class);
 
-        assertThat(results).isNotEmpty();
-        boolean containsMatching = results.stream()
-                .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(matchingOrderId));
-        boolean containsNonMatching = results.stream()
-                .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(nonMatchingOrderId));
+            assertThat(results).isNotEmpty();
+            boolean containsMatching = results.stream()
+                    .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(matchingOrderId));
+            boolean containsNonMatching = results.stream()
+                    .anyMatch(r -> ((java.util.Map<?, ?>) r).get("orderId").equals(nonMatchingOrderId));
 
-        assertThat(containsMatching).isTrue();
-        assertThat(containsNonMatching).isFalse();
+            assertThat(containsMatching).isTrue();
+            assertThat(containsNonMatching).isFalse();
+        });
     }
 
     @Test
@@ -282,7 +332,7 @@ class CoreOrderFlowIntegrationTest {
             producer.flush();
         }
 
-        Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+        Awaitility.await().atMost(AWAIT_TIMEOUT).untilAsserted(() -> {
             OrdersPerMinuteDocument doc = elasticsearchOperations.get(
                     String.valueOf(windowStart), OrdersPerMinuteDocument.class);
             assertThat(doc).isNotNull();

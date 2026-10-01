@@ -1,0 +1,94 @@
+# Read docs/github-actions-fundamentals.md first, and see
+# backend-deploy.yml's own top comment for the Phase 0 setup prerequisite
+# (OrderFlowFrontendStack + OrderFlowGithubOidcStack must already be
+# deployed) — both apply equally here.
+name: Frontend Deploy
+
+"on":
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  DEPLOY_ROLE_ARN: arn:aws:iam::027677879393:role/orderflow-github-deploy-role
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci
+
+      # Real per-environment values, injected from GitHub Environment
+      # variables (Settings -> Environments -> production -> Variables) —
+      # see docs/github-actions-fundamentals.md §7 for why these are
+      # `vars.*`, not `secrets.*`: an ALB DNS name is a public hostname,
+      # not a secret. Falls back to each var's own name as a visible
+      # placeholder if unset, so a misconfigured environment fails loudly
+      # in the build output rather than silently shipping "undefined".
+      # See frontend/.env.example for what each of these five URLs means
+      # and why there are five instead of one shared origin.
+      - name: npm run build
+        env:
+          VITE_ORDERS_API_URL: ${{ vars.VITE_ORDERS_API_URL }}
+          VITE_SAGA_API_URL: ${{ vars.VITE_SAGA_API_URL }}
+          VITE_ANALYTICS_API_URL: ${{ vars.VITE_ANALYTICS_API_URL }}
+          VITE_FRAUD_API_URL: ${{ vars.VITE_FRAUD_API_URL }}
+          VITE_SEARCH_API_URL: ${{ vars.VITE_SEARCH_API_URL }}
+        run: npm run build
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Read the bucket name + distribution id from CloudFormation's own
+      # outputs (cloud/cdk/lib/frontend-stack.ts's CfnOutputs) instead of
+      # hand-copying them into a GitHub variable — one fewer place these
+      # two values could drift out of sync with what's actually deployed.
+      - name: Look up frontend infrastructure
+        id: infra
+        run: |
+          bucket=$(aws cloudformation describe-stacks \
+            --stack-name OrderFlowFrontendStack \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendBucketName'].OutputValue" \
+            --output text)
+          distribution_id=$(aws cloudformation describe-stacks \
+            --stack-name OrderFlowFrontendStack \
+            --query "Stacks[0].Outputs[?OutputKey=='FrontendDistributionId'].OutputValue" \
+            --output text)
+          echo "bucket=$bucket" >> "$GITHUB_OUTPUT"
+          echo "distribution_id=$distribution_id" >> "$GITHUB_OUTPUT"
+
+      # --delete removes objects in the bucket that no longer exist in
+      # dist/ (e.g. a renamed hashed chunk from the PREVIOUS build) — S3
+      # is a full mirror of the latest build's output, not an
+      # ever-growing pile of every build that's ever run.
+      - name: Sync build output to S3
+        run: |
+          aws s3 sync dist/ "s3://${{ steps.infra.outputs.bucket }}" --delete
+
+      # Without this, CloudFront keeps serving cached (stale) objects for
+      # up to CachePolicy.CACHING_OPTIMIZED's TTL after every deploy — a
+      # real "why isn't my change showing up" trap. "/*" invalidates
+      # everything rather than trying to enumerate exactly which files
+      # changed, which is simpler and, for a SPA this size, cheap enough
+      # not to bother optimizing.
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.infra.outputs.distribution_id }}" \
+            --paths "/*"

@@ -31,6 +31,19 @@ multi-machine throughput numbers. See
 as a from-scratch, phase-by-phase build log for anyone who (like this
 project's own author, going in) doesn't yet know AWS CDK/ECS.
 
+A React + MUI frontend (`frontend/`) puts a UI in front of all of the
+above — a customer-facing order flow (place an order, choosing between
+the choreography and orchestration saga styles live, then track it) plus
+an ops dashboard (analytics, fraud lookups, faceted order search). See
+[`docs/frontend-architecture.md`](docs/frontend-architecture.md) for the
+React/MUI/TanStack Query/Zustand architecture and why each choice was
+made. Both the backend and the frontend deploy to AWS via GitHub Actions
+— CI runs automatically on every push/PR, deploys are manual
+(`workflow_dispatch`) — see
+[`docs/github-actions-fundamentals.md`](docs/github-actions-fundamentals.md)
+for the CI/CD concepts and the one-time AWS setup required before a
+deploy workflow can run.
+
 ## Where we are right now
 
 **Build Order Steps 1–11 are done:** `order-service` publishes to Kafka;
